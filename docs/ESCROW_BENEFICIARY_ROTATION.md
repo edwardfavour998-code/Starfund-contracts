@@ -58,11 +58,19 @@ Both must sign in the same transaction. This prevents unilateral redirection of 
    - Condition: `new_sme_address != escrow.sme_address`
    - Rotating to the current address is rejected.
 
-6. **Dual authorization**
+6. **Role-separation guard (read-only)**
+   - Condition: `new_sme_address` must not equal any other role address:
+     - the current `admin` → rejected with `NewSmeIsAdmin` (185)
+     - the current `treasury` → rejected with `NewSmeIsTreasury` (186)
+     - the escrow contract's own address (`env.current_contract_address()`) → rejected with `NewSmeIsEscrow` (187)
+   - This mirrors the distinct-address policy enforced at `init` (admin, SME and treasury must all differ, and the beneficiary cannot be the escrow itself), so a rotation can never invalidate the deployment invariants.
+   - The check runs against the *current* role addresses, so it reflects any admin/treasury changes made since initialization.
+
+7. **Dual authorization**
    - `escrow.sme_address.require_auth()`
    - `escrow.admin.require_auth()`
 
-7. **Storage write + event emission**
+8. **Storage write + event emission**
    - Persists the updated `sme_address` into `DataKey::Escrow`.
    - Emits `BeneficiaryRotated`.
 
@@ -106,6 +114,18 @@ These are the typed `EscrowError` variants emitted by `rotate_beneficiary`:
 - **`NewSmeSameAsCurrent` (162)**
   - Trigger: `new_sme_address == escrow.sme_address`.
   - Meaning: no-op rotations are rejected.
+
+- **`NewSmeIsAdmin` (185)**
+  - Trigger: `new_sme_address == escrow.admin`.
+  - Meaning: the admin and SME roles must stay separate; pick a distinct beneficiary.
+
+- **`NewSmeIsTreasury` (186)**
+  - Trigger: `new_sme_address == escrow.treasury`.
+  - Meaning: the treasury and SME roles must stay separate; pick a distinct beneficiary.
+
+- **`NewSmeIsEscrow` (187)**
+  - Trigger: `new_sme_address == env.current_contract_address()`.
+  - Meaning: the escrow contract cannot be its own beneficiary (self-address is rejected, as at `init`).
 
 ---
 
@@ -160,6 +180,7 @@ Fields:
 ## Security notes (operator guidance)
 
 - Rotation is intentionally **not** a proposal/accept flow. It is a single call requiring both the outgoing SME and admin signatures.
+- Rotation preserves the init-time role separation: the new SME cannot be the current admin, the current treasury, or the escrow contract itself. Because the guard reads current role addresses, rotating the admin or treasury first and then rotating the SME is still validated against the up-to-date roles.
 - Legal hold blocks beneficiary rotation before any authorization checks run.
 - Rotation only affects the withdrawal destination (`sme_address`). It does not move tokens directly; token routing happens in `withdraw`.
 - If you operate with multisig governance, ensure the admin key used for `rotate_beneficiary` signing cannot be invoked unilaterally without SME consent (and vice-versa), matching the intended dual-control policy.

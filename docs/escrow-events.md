@@ -446,7 +446,6 @@ The pending index entry for the callback is removed; other registered callbacks 
 - After cancellation the callback can no longer execute: a later `execute_callback`
   for the same `origin`/`phase`/`nonce` fails with the contract's callback-not-found error.
 - Cancellation is per-callback; other pending registrations remain active and executable.
-=======
 
 ---
 

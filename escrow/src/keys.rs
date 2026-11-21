@@ -29,6 +29,15 @@
 //! `.unwrap_or(default)` and its absence does not change existing entrypoint semantics.
 //! Renaming a variant, changing its XDR discriminant, or altering the stored type of an
 //! existing key is **breaking** and requires a `migrate` path or a full redeploy.
+//!
+//! ## Admin nonce ownership
+//!
+//! The administrative nonce key family is reserved for authenticated admin actions.
+//! Permissionless expired-proposal cleanup performed by `recover_admin` deliberately does
+//! **not** read or consume the admin nonce: cleanup is a garbage-collection operation and
+//! must never advance replay protection for a prepared, signed administrative invocation.
+//! Any future key introduced for cleanup bookkeeping must therefore be a distinct,
+//! additive key (see ADR-007) and must not alias the admin nonce key.
 
 use crate::DataKey;
 use soroban_sdk::Address;

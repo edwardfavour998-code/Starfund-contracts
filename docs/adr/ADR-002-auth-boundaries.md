@@ -2,7 +2,7 @@
 
 **Status:** Accepted  
 **Date:** 2026-03-28  
-**Refs:** `escrow/src/lib.rs` — `init`, `fund`, `settle`, `withdraw`, `claim_investor_payout`, `sweep_terminal_dust`, `set_legal_hold`, `propose_admin`, `accept_admin`
+**Refs:** `escrow/src/lib.rs` — `init`, `fund`, `settle`, `withdraw`, `claim_investor_payout`, `sweep_terminal_dust`, `set_legal_hold`, `propose_admin`, `accept_admin`, `rotate_beneficiary`, `recover_admin`, `consume_admin_nonce`
 
 ---
 
@@ -30,6 +30,20 @@ Multiple principals interact with the escrow (admin, SME, investors, treasury). 
 
 There is no superuser that can act as all roles simultaneously unless the same key is used for multiple roles — which is a deployment concern, not a contract concern.
 
+### Role-address separation policy (issues #430, #195, #251)
+
+`init` enforces a deployment invariant: `admin`, `sme_address` and `treasury` must be pairwise distinct, and the escrow contract's own address cannot be the beneficiary. This is not merely an init-time check; it is a **policy that every later authorized rotation must preserve**, validated against the *current* role addresses:
+
+- `rotate_beneficiary(new_sme)` rejects `new_sme` equal to the current SME (`NewSmeSameAsCurrent`), the current `admin`, the current `treasury`, or the escrow contract address.
+- `propose_admin(new_admin)` rejects `new_admin` equal to the current admin (`NewAdminSameAsCurrent`), the current SME, or the current treasury.
+- `accept_admin()` **rechecks** the pending admin against the *then-current* SME and treasury, because those roles can change between nomination and acceptance. A pending admin that now conflicts with a changed role is rejected explicitly (the pending proposal is not silently promoted); the current admin must re-nominate a non-conflicting address. The pending entry is cleared so a stale, conflicting proposal cannot be replayed.
+
+The shared policy lives in a single helper so new governance entrypoints cannot diverge from it.
+
+### Permissionless cleanup vs. authenticated nonce (issue #431)
+
+`recover_admin` deliberately omits current-admin authorization so that an expired pending proposal can be garbage-collected even if the admin key is lost. It must **not** advance the shared administrative nonce: `consume_admin_nonce` is only invoked by authenticated governance paths (i.e. after the relevant `require_auth()`), never by the permissionless cleanup path. Consequently an unrelated caller can remove an expired proposal but cannot invalidate an already-prepared administrative invocation that uses that nonce. Cleanup events record the caller as the cleanup authority (distinct from governance authority) so the two are auditable separately.
+
 ## Consequences
 
 - A compromised investor key cannot settle or sweep funds.
@@ -38,6 +52,10 @@ There is no superuser that can act as all roles simultaneously unless the same k
 - Legal hold can only be set/cleared by admin, so governance controls compliance freezes.
 - Admin authority changes only after both the current admin and successor have authorized. A typo in `new_admin` can be corrected by a new `propose_admin` call and does not lock admin-gated paths.
 - `DataKey::PendingAdmin` is cleared after successful acceptance so stale proposals cannot be reused.
+- Role separation (admin/SME/treasury distinct, escrow not a beneficiary) holds for the lifetime of the escrow, not just at `init`; rotations cannot collapse roles onto one key.
+- A pending admin that conflicts with a role changed after nomination is rejected at acceptance rather than promoted, so a nomination cannot be used to bypass the separation policy.
+- Permissionless `recover_admin` cleanup cannot advance the governance nonce, so an unrelated caller cannot invalidate a prepared authenticated administrative action; key-loss recovery of expired proposals remains available.
+======= 
 
 ## Rejected alternatives
 
@@ -49,7 +67,8 @@ There is no superuser that can act as all roles simultaneously unless the same k
 Certain administrative entrypoints enforce a no-op guard to reject updates that do not change the existing state, preventing noisy events and wasted storage writes:
 - **`update_maturity`**: Rejects `new_maturity == old_maturity` (`MaturityUnchanged`).
 - **`propose_admin`**: Rejects `new_admin == current_admin` (`NewAdminSameAsCurrent`).
-- **`rotate_beneficiary`**: Rejects `new_sme == current_sme` (`NewSmeSameAsCurrent`).
+- **`rotate_beneficiary`**: Rejects `new_sme == current_sme` (`NewSmeSameAsCurrent`), and also rejects `new_sme` equal to the current admin, treasury, or the escrow address (role-separation policy, issue #430).
+- **`propose_admin` / `accept_admin`**: `propose_admin` rejects a `new_admin` equal to the current SME or treasury; `accept_admin` rechecks the pending admin against the current SME and treasury and rejects a conflicting pending proposal (issue #430).
 
 ## Shared gate helpers (issue #626)
 

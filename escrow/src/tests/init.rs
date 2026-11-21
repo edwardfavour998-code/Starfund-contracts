@@ -109,6 +109,176 @@ fn test_init_rejects_contract_address_as_token_or_recipient() {
 }
 
 #[test]
+fn test_init_rejects_admin_equal_sme() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let shared = Address::generate(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    assert_contract_error(
+        client.try_init(
+            &shared,
+            &soroban_sdk::String::from_str(&env, "ROLE-ADM-SME"),
+            &shared,
+            &1_000i128,
+            &800i64,
+            &0u64,
+            &token,
+            &None,
+            &treasury,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None::<i64>,
+            &None::<u32>,
+        ),
+        EscrowError::AdminEqualsSme,
+    );
+}
+
+#[test]
+fn test_init_rejects_admin_equal_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let shared = Address::generate(&env);
+    let (token, sme) = free_addresses(&env);
+
+    assert_contract_error(
+        client.try_init(
+            &shared,
+            &soroban_sdk::String::from_str(&env, "ROLE-ADM-TRE"),
+            &sme,
+            &1_000i128,
+            &800i64,
+            &0u64,
+            &token,
+            &None,
+            &shared,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None::<i64>,
+            &None::<u32>,
+        ),
+        EscrowError::AdminEqualsTreasury,
+    );
+}
+
+#[test]
+fn test_init_rejects_sme_equal_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let shared = Address::generate(&env);
+    let (token, admin) = free_addresses(&env);
+
+    assert_contract_error(
+        client.try_init(
+            &admin,
+            &soroban_sdk::String::from_str(&env, "ROLE-SME-TRE"),
+            &shared,
+            &1_000i128,
+            &800i64,
+            &0u64,
+            &token,
+            &None,
+            &shared,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None::<i64>,
+            &None::<u32>,
+        ),
+        EscrowError::SmeEqualsTreasury,
+    );
+}
+
+#[test]
+fn test_init_rejects_sme_equal_contract_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_address, client) = deploy_with_id(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    assert_contract_error(
+        client.try_init(
+            &Address::generate(&env),
+            &soroban_sdk::String::from_str(&env, "ROLE-SME-SELF"),
+            &contract_address,
+            &1_000i128,
+            &800i64,
+            &0u64,
+            &token,
+            &None,
+            &treasury,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None::<i64>,
+            &None::<u32>,
+        ),
+        EscrowError::InitAddressIsContract,
+    );
+}
+
+#[test]
+fn test_init_accepts_distinct_role_addresses() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    let escrow = client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "ROLE-OK"),
+        &sme,
+        &1_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    assert_eq!(escrow.admin, admin);
+    assert_eq!(escrow.sme_address, sme);
+    assert_eq!(client.get_treasury(), treasury);
+}
+
+#[test]
 fn test_init_stores_keyed_invoice_and_lists_it() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);

@@ -13,6 +13,24 @@ This document describes the authorization rules governing the **SME beneficiary*
 | **Investor** | Per-investor `DataKey::InvestorContribution` | Funds the escrow; claims payouts or refunds. | Self-authorized per call |
 | **Treasury** | `DataKey::Treasury` (immutable) | Receives protocol fees and terminal dust. | Immutable after `init` |
 
+### Deployment Invariant: Role-Address Separation
+
+The three privileged addresses are **pairwise distinct**, and the escrow contract's own address can never be the beneficiary:
+
+- `admin != sme_address`
+- `admin != treasury`
+- `sme_address != treasury`
+- `sme_address != <escrow contract address>`
+
+This invariant is enforced at every point where a role address can be introduced or changed:
+
+| Entrypoint | Enforcement |
+|------------|-------------|
+| `init` | Rejects any configuration violating the separation policy (distinct admin/SME/treasury; escrow self-address rejected as beneficiary). |
+| `rotate_beneficiary` | Rejects a `new_sme_address` equal to the current SME, the admin, the treasury, or the escrow contract address. |
+| `propose_admin` | Rejects a nominee equal to the current admin, the current SME, or the treasury. |
+| `accept_admin` | **Rechecks** the pending nominee against the *current* roles (SME and treasury) at acceptance time, because roles may have changed since nomination. A pending admin that now conflicts is rejected explicitly rather than silently accepted. |
+
 ---
 
 ## Authorization Mechanisms
@@ -33,7 +51,7 @@ All authorization in the contract uses **Soroban `Address::require_auth()`**, wh
 
 | Entrypoint | Authorized Role | Allowed States | Legal Hold Gate | Pause Gate | Auth Mechanism |
 |------------|----------------|----------------|----------------|------------|----------------|
-| `rotate_beneficiary` | **SME + Admin** (both) | Open (0), Funded (1) | Blocks with `LegalHoldBlocksBeneficiaryRotation` (160) | Blocks with `PausedBlocksBeneficiaryRotation` (183, any pause scope) | `sme_address.require_auth()` + `admin.require_auth()` |
+| `rotate_beneficiary` | **SME + Admin** (both) | Open (0), Funded (1) | Blocks with `LegalHoldBlocksBeneficiaryRotation` (160) | Blocks with `PausedBlocksBeneficiaryRotation` (183, any pause scope) | `sme_address.require_auth()` + `admin.require_auth()`; `new_sme_address` must satisfy the role-address separation policy |
 | `withdraw` | **SME** | Funded (1) | Blocks with `LegalHoldBlocksWithdrawal` (123) | Blocks with `PausedBlocksWithdrawal` (212) | `load_escrow_require_sme` → `sme_address.require_auth()` |
 | `settle` | **SME** | Funded (1) | Blocks with `LegalHoldBlocksSettlement` (120) | Blocks with `PausedBlocksSettlement` (211) | `load_escrow_require_sme` → `sme_address.require_auth()` |
 | `partial_settle` | **SME OR Admin** | Open (0) | Blocks with `LegalHoldBlocksPartialSettle` (201) | None | `caller.require_auth()` + `ensure(caller == sme_address \|\| caller == admin)` |
@@ -57,6 +75,8 @@ All authorization in the contract uses **Soroban `Address::require_auth()`**, wh
 | `propose_admin` | **Admin** (current) | Any | No | No |
 | `accept_admin` | **Pending Admin** | Any | No | No |
 
+> **Note:** `propose_admin` rejects nominees that collide with the current admin, SME, or treasury. `accept_admin` rechecks the pending nominee against the current SME and treasury (roles may have changed since nomination); a conflicting pending admin is rejected explicitly.
+
 ---
 
 ## Guard Ordering
@@ -77,8 +97,9 @@ Every entrypoint evaluates guards in a fixed order. The general pattern is:
 2. Read escrow from storage
 3. State gate (pre-settlement)  → ensure(is_pre_settlement_status, RotationNotOpen)
 4. No-op guard                  → ensure(new != current, NewSmeSameAsCurrent)
-5. Dual authorization           → sme_address.require_auth() + admin.require_auth()
-6. Storage write + event emit   → BeneficiaryRotated, BenChange
+5. Role-address policy          → ensure(new != admin && new != treasury && new != escrow address)
+6. Dual authorization           → sme_address.require_auth() + admin.require_auth()
+7. Storage write + event emit   → BeneficiaryRotated, BenChange
 ```
 
 ### `withdraw` guard order (src/lib.rs:4371)
@@ -201,9 +222,10 @@ Guard evaluation:
 1. Legal hold inactive → passes.
 2. Status is 0 (open) → `is_pre_settlement_status` returns true → passes.
 3. `G_SME_B != G_SME_A` → passes (no-op guard).
-4. `G_SME_A.require_auth()` verifies current SME's signature → passes.
-5. `G_ADMIN.require_auth()` verifies admin's signature → passes.
-6. Storage updated: `sme_address = G_SME_B`.
+4. `G_SME_B` is not the admin, treasury, or escrow contract address → passes (role-address policy).
+5. `G_SME_A.require_auth()` verifies current SME's signature → passes.
+6. `G_ADMIN.require_auth()` verifies admin's signature → passes.
+7. Storage updated: `sme_address = G_SME_B`.
 
 Post-rotation state:
 - `sme_address` = `G_SME_B`
@@ -277,6 +299,7 @@ Gates `rotate_beneficiary`.
 ## Cross-References
 
 - [`docs/beneficiary.md`](./beneficiary.md) — Design doc, data model, behavioral invariants.
+- [`docs/adr/ADR-002-auth-boundaries.md`](./adr/ADR-002-auth-boundaries.md) — Auth boundaries ADR (role-address separation policy).
 - [`docs/ESCROW_BENEFICIARY_ROTATION.md`](./ESCROW_BENEFICIARY_ROTATION.md) — Operator reference for rotation flow, dual auth rationale, event schemas.
 - [`docs/STATE_MACHINE_IMPLEMENTATION.md`](./STATE_MACHINE_IMPLEMENTATION.md) — State machine with full transition matrix and forbidden transitions.
 - [`docs/escrow-lifecycle.md`](./escrow-lifecycle.md) — Lifecycle doc with SME vs Admin role table.

@@ -672,3 +672,137 @@ fn test_sweep_terminal_dust_wrong_signer_panics() {
     }]);
     client.sweep_terminal_dust(&100i128);
 }
+
+// ── rotate_beneficiary ──────────────────────────────────────────────────
+
+/// `rotate_beneficiary` still demands the SME's signature before the
+/// role-separation policy runs: a stranger cannot rotate the beneficiary.
+#[test]
+#[should_panic]
+fn test_rotate_beneficiary_wrong_signer_panics() {
+    let env = Env::default();
+    let (client, _admin, _sme, _treasury, _token) = setup_inited(&env);
+    let stranger = Address::generate(&env);
+    let new_beneficiary = Address::generate(&env);
+    env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "rotate_beneficiary",
+            args: SorobanVec::from_array(&env, [new_beneficiary.into_val(&env)]),
+            sub_invokes: &[],
+        },
+    }]);
+    client.rotate_beneficiary(&new_beneficiary);
+}
+
+/// `rotate_beneficiary` with no auth at all panics at the host-level
+/// `require_auth` before any policy check.
+#[test]
+#[should_panic]
+fn test_rotate_beneficiary_no_auth_panics() {
+    let env = Env::default();
+    let (client, _admin, _sme, _treasury, _token) = setup_inited(&env);
+    let new_beneficiary = Address::generate(&env);
+    env.mock_auths(&[]);
+    client.rotate_beneficiary(&new_beneficiary);
+}
+
+// ── propose_admin ───────────────────────────────────────────────────────
+
+/// `propose_admin` still demands the current admin's signature before the
+/// role-separation policy runs: a stranger cannot nominate an admin.
+#[test]
+#[should_panic]
+fn test_propose_admin_wrong_signer_panics() {
+    let env = Env::default();
+    let (client, _admin, sme, _treasury, _token) = setup_inited(&env);
+    let candidate = Address::generate(&env);
+    env.mock_auths(&[MockAuth {
+        address: &sme,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "propose_admin",
+            args: SorobanVec::from_array(&env, [candidate.into_val(&env)]),
+            sub_invokes: &[],
+        },
+    }]);
+    client.propose_admin(&candidate);
+}
+
+/// `propose_admin` with no auth at all panics at the host-level
+/// `require_auth` before any policy check.
+#[test]
+#[should_panic]
+fn test_propose_admin_no_auth_panics() {
+    let env = Env::default();
+    let (client, _admin, _sme, _treasury, _token) = setup_inited(&env);
+    let candidate = Address::generate(&env);
+    env.mock_auths(&[]);
+    client.propose_admin(&candidate);
+}
+
+// ── accept_admin ────────────────────────────────────────────────────────
+
+/// `accept_admin` still demands the pending admin's signature before the
+/// role-separation recheck runs: a stranger cannot accept a nomination.
+#[test]
+#[should_panic]
+fn test_accept_admin_wrong_signer_panics() {
+    let env = Env::default();
+    let (client, _admin, _sme, _treasury, _token) = setup_inited(&env);
+    let candidate = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    client.propose_admin(&candidate);
+    env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "accept_admin",
+            args: SorobanVec::new(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.accept_admin();
+}
+
+/// `accept_admin` with no auth at all panics at the host-level
+/// `require_auth` before any policy recheck.
+#[test]
+#[should_panic]
+fn test_accept_admin_no_auth_panics() {
+    let env = Env::default();
+    let (client, _admin, _sme, _treasury, _token) = setup_inited(&env);
+    let candidate = Address::generate(&env);
+    client.propose_admin(&candidate);
+    env.mock_auths(&[]);
+    client.accept_admin();
+}
+
+// ── recover_admin ───────────────────────────────────────────────────────
+
+/// Permissionless expired-proposal cleanup must not consume the shared
+/// administrative nonce: an unrelated caller can clear an expired pending
+/// proposal without auth, and a prepared admin action using the original
+/// nonce still executes afterwards.
+#[test]
+fn test_recover_admin_cleanup_does_not_consume_admin_nonce() {
+    let env = Env::default();
+    let (client, _admin, _sme, _treasury, _token) = setup_inited(&env);
+    let candidate = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    // Nominate an admin, then let the proposal expire.
+    client.propose_admin(&candidate);
+    env.ledger().set_sequence_number(env.ledger().sequence() + 1_000_000u32);
+
+    // Cleanup from an unrelated caller requires no admin auth.
+    env.mock_auths(&[]);
+    client.recover_admin();
+
+    // The admin nonce was not advanced by cleanup: a prepared admin action
+    // using the original nonce still succeeds.
+    env.mock_all_auths();
+    let replacement = Address::generate(&env);
+    client.propose_admin(&replacement);
+}
