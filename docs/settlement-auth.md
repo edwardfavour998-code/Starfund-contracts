@@ -70,10 +70,17 @@ Finalizes the escrow after maturity (when configured), transitioning to `status 
 | **State transition** | `1 → 2` (writes `SettledAt` ledger timestamp, emits `EscrowSettled` event) |
 | **Settle pool computation** | Exact investor liability from `get_settlement_pool()`, including largest-remainder allocation across tier-adjusted payouts |
 
+Settlement is **SME-only** and permissionless settlement is **not** supported. The SME
+authorization is enforced by the public `settle` entrypoint itself (via
+`load_escrow_require_sme`) **before** any state effects, so a call with no authorization or
+with an unrelated signer is rejected and leaves status, `SettledAt` and events unchanged.
+Any future decision to make settlement permissionless would require an explicit protocol
+decision and a corresponding update to this document and all callers.
+
 **Guard ordering:**
 1. `ensure(!paused_active, PausedBlocksSettlement)`
 2. `guard_not_legal_hold(..., LegalHoldBlocksSettlement)`
-3. `load_escrow_require_sme` (loads escrow + `sme_address.require_auth()`)
+3. `load_escrow_require_sme` (loads escrow + `sme_address.require_auth()`) — SME-only authorization, enforced before effects
 4. `ensure(status != 2, EscrowAlreadySettled)` — once-only guard; a re-entrant/replayed second settle is rejected here
 5. `ensure(status == 1, SettlementNotFunded)`
 6. `if maturity > 0 { ensure(now >= maturity, MaturityNotReached) }`
@@ -85,6 +92,12 @@ input address. Each target's normal settlement checks apply independently: succe
 remain settled when another entry fails. Outcomes are `Settled`, `FailedContract(code)` for a
 target contract error, or `FailedInvocation` for other invocation failures. Empty and oversized
 batches still fail the batch call with `SettlementBatchEmpty` and `SettlementBatchTooLarge`.
+
+Batching does **not** relax authorization: every target escrow is settled through the same
+SME-only policy as `settle`, so each target requires its own `sme_address` authorization
+(`load_escrow_require_sme`). A target whose SME authorization is missing or supplied by an
+unrelated signer fails with the corresponding contract error and is reported as
+`FailedContract(code)`; its status, `SettledAt` and events are left unchanged.
 
 ---
 
@@ -221,7 +234,8 @@ Treasury sweeps residual funding-token balance from a terminal escrow (status 2,
 | Entrypoint | Role | Auth Source | Legal Hold | Pause | Status Gate | State Transition |
 |------------|------|-------------|------------|-------|-------------|------------------|
 | `partial_settle` | SME \|\| Admin | `caller` arg | ✅ 201 | ❌ | `status == 0` | `0 → 1` |
-| `settle` | SME | `sme_address` | ✅ 120 | ✅ 211 | `status == 1` + maturity | `1 → 2` |
+| `settle` | SME | `sme_address` (`load_escrow_require_sme`) | ✅ 120 | ✅ 211 | `status == 1` + maturity | `1 → 2` |
+| `settle_batch` | SME (per target) | `sme_address` per target (`load_escrow_require_sme`) | ✅ 120 (per target) | ✅ 211 (per target) | `status == 1` + maturity (per target) | `1 → 2` (per target) |
 | `withdraw` | SME | `sme_address` | ✅ 123 | ✅ 212 | `status == 1` + balance | `1 → 3` |
 | `claim_investor_payout` | Investor | `investor` arg | ✅ 125 | ✅ 213 | `status == 2` + lock | `2 → 2` (claimed) |
 | `cancel_funding` | Admin | `admin` | ✅ 140 | ❌ | `status == 0` | `0 → 4` |
@@ -343,7 +357,11 @@ client.refund(&investor);  // requires investor auth
 
 4. **Admin vs SME authority**: 
    - Admin: `cancel_funding`, `partial_settle`, `set_legal_hold`, `set_paused`, `sweep_terminal_dust` (via treasury)
-   - SME: `partial_settle`, `settle`, `withdraw`, `rotate_beneficiary`
+   - SME: `partial_settle`, `settle`, `settle_batch` (per target), `withdraw`, `rotate_beneficiary`
+
+7. **Settlement is SME-only**: `settle` and each target of `settle_batch` require the escrow's
+   `sme_address` authorization before any state effects. Missing or unrelated signers cannot
+   satisfy this policy; rejected calls leave status, `SettledAt` and events unchanged.
 
 5. **Checks-effects-interactions**: All fund-moving operations (`withdraw`, `claim_investor_payout`, `refund`, `sweep_terminal_dust`) update state **before** external token transfers.
 

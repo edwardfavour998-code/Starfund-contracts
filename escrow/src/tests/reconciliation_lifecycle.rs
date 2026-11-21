@@ -405,6 +405,211 @@ fn reconciliation_deficit_display() {
     assert_invariant(&client, &token);
 }
 
+// ── Test: liability calculation is independent of escrow storage (#428) ──────
+// `get_reconciliation` and `sweep_terminal_dust` must derive outstanding
+// liability from `funded_amount - get_distributed_principal()` (floored at
+// zero) rather than from any stored settlement-pool member.  The stored
+// `InvoiceEscrow` representation must remain unchanged.
+
+#[test]
+fn reconciliation_liability_uses_approved_calculation() {
+    let env = Env::default();
+    let (client, token, _sme) = setup_escrow(&env, 1000, "LIABILITY01");
+
+    let inv_a = Address::generate(&env);
+    let inv_b = Address::generate(&env);
+
+    // Fund below target: liability tracks funded_amount exactly.
+    mint_and_fund(&client, &token, &inv_a, 300);
+    let escrow = client.get_escrow();
+    assert_eq!(escrow.funded_amount, 300);
+    assert_eq!(client.get_distributed_principal(), 0);
+    let view = client.get_reconciliation();
+    assert_eq!(view.outstanding_liability, 300);
+    assert_invariant(&client, &token);
+
+    // Cross target: liability follows the over-funded total.
+    mint_and_fund(&client, &token, &inv_b, 900);
+    let escrow = client.get_escrow();
+    assert_eq!(escrow.funded_amount, 1200);
+    assert_eq!(client.get_distributed_principal(), 0);
+    let view = client.get_reconciliation();
+    assert_eq!(view.outstanding_liability, 1200);
+    assert_invariant(&client, &token);
+
+    // Cancel and refund partially: liability = funded_amount - DP.
+    client.cancel_funding(&0u32);
+    client.refund(&inv_a);
+    let escrow = client.get_escrow();
+    assert_eq!(escrow.funded_amount, 1200);
+    assert_eq!(client.get_distributed_principal(), 300);
+    let view = client.get_reconciliation();
+    assert_eq!(view.outstanding_liability, 900);
+    assert_invariant(&client, &token);
+
+    // Full refund: liability floors at zero, never negative.
+    client.refund(&inv_b);
+    assert_eq!(client.get_distributed_principal(), 1200);
+    let view = client.get_reconciliation();
+    assert_eq!(view.outstanding_liability, 0);
+    assert_eq!(view.surplus, 0);
+    assert_invariant(&client, &token);
+}
+
+// ── Test: mixed-yield settlement keeps liability on principal only (#428) ────
+
+#[test]
+fn reconciliation_mixed_yield_settlement_liability() {
+    let env = Env::default();
+    let (client, token, _sme) = setup_escrow(&env, 1000, "MIXYIELD01");
+
+    let inv_a = Address::generate(&env);
+    let inv_b = Address::generate(&env);
+
+    mint_and_fund(&client, &token, &inv_a, 400);
+    mint_and_fund(&client, &token, &inv_b, 600);
+    assert_eq!(client.get_escrow().status, 1);
+
+    // coupon = 1000 * 800 / 10_000 = 80; mint yield on top of principal.
+    let yield_coupon = 80i128;
+    token.stellar.mint(&client.address, &yield_coupon);
+    client.settle();
+    assert_eq!(client.get_escrow().status, 2);
+
+    // Liability is principal-only; yield shows up as surplus.
+    let view = client.get_reconciliation();
+    assert_eq!(view.outstanding_liability, 1000);
+    assert_eq!(view.surplus, yield_coupon);
+    assert_invariant(&client, &token);
+
+    // Partial claim: liability unchanged, surplus shrinks by the payout.
+    // payout_A = 400 * 1080 / 1000 = 432
+    client.claim_investor_payout(&inv_a);
+    let view = client.get_reconciliation();
+    assert_eq!(view.outstanding_liability, 1000);
+    assert_eq!(view.surplus, (1080 - 432) - 1000);
+    assert_invariant(&client, &token);
+
+    // Remaining claim: liability still principal-only, surplus now negative.
+    // payout_B = 600 * 1080 / 1000 = 648
+    client.claim_investor_payout(&inv_b);
+    let view = client.get_reconciliation();
+    assert_eq!(view.outstanding_liability, 1000);
+    assert_eq!(view.surplus, -1000i128);
+    assert_invariant(&client, &token);
+}
+
+// ── Test: sweep limit honours the approved liability floor (#428) ────────────
+
+#[test]
+fn sweep_terminal_dust_respects_liability_floor() {
+    let env = Env::default();
+    let (client, token, _sme) = setup_escrow(&env, 1000, "SWEEPLIM01");
+
+    let inv_a = Address::generate(&env);
+    let inv_b = Address::generate(&env);
+
+    mint_and_fund(&client, &token, &inv_a, 400);
+    mint_and_fund(&client, &token, &inv_b, 600);
+    client.cancel_funding(&0u32);
+
+    // No dust yet: any sweep must be rejected by the liability floor.
+    let view = client.get_reconciliation();
+    assert_eq!(view.outstanding_liability, 1000);
+    assert_eq!(view.surplus, 0);
+    assert!(
+        client.try_sweep_terminal_dust(&1i128).is_err(),
+        "sweep must be blocked when no surplus exists",
+    );
+
+    // Mint dust: exactly the surplus is sweepable.
+    let dust = 25i128;
+    token.stellar.mint(&client.address, &dust);
+    let view = client.get_reconciliation();
+    assert_eq!(view.outstanding_liability, 1000);
+    assert_eq!(view.surplus, dust);
+    assert!(
+        client.try_sweep_terminal_dust(&(dust + 1)).is_err(),
+        "sweep above surplus must be blocked by liability floor",
+    );
+    let swept = client.sweep_terminal_dust(&dust);
+    assert_eq!(swept, dust);
+    assert_eq!(client.get_reconciliation().outstanding_liability, 1000);
+    assert_invariant(&client, &token);
+
+    // Partial refund lowers the floor: liability = funded_amount - DP.
+    client.refund(&inv_a);
+    assert_eq!(client.get_distributed_principal(), 400);
+    let view = client.get_reconciliation();
+    assert_eq!(view.outstanding_liability, 600);
+    assert_eq!(view.surplus, 0);
+    assert!(
+        client.try_sweep_terminal_dust(&1i128).is_err(),
+        "sweep must remain blocked after partial refund",
+    );
+    assert_invariant(&client, &token);
+
+    // Final refund: liability floors at zero and remaining dust is sweepable.
+    client.refund(&inv_b);
+    assert_eq!(client.get_distributed_principal(), 1000);
+    let view = client.get_reconciliation();
+    assert_eq!(view.outstanding_liability, 0);
+    assert_eq!(view.surplus, 0);
+    assert_invariant(&client, &token);
+}
+
+// ── Test: stored InvoiceEscrow representation is unchanged (#428) ────────────
+// Reconciliation and sweep must not depend on any extra stored member; the
+// persisted escrow fields keep their expected values throughout the lifecycle.
+
+#[test]
+fn invoice_escrow_storage_unchanged_by_reconciliation() {
+    let env = Env::default();
+    let (client, token, sme) = setup_escrow(&env, 1000, "STORAGE01");
+
+    let investor = Address::generate(&env);
+
+    // Snapshot the stored representation before any reconciliation call.
+    let before = client.get_escrow();
+    assert_eq!(before.funded_amount, 0);
+    assert_eq!(before.status, 0);
+    assert_eq!(before.target_amount, 1000);
+    assert_eq!(before.sme, sme);
+
+    // Calling the view must not mutate stored state.
+    let _ = client.get_reconciliation();
+    let after_view = client.get_escrow();
+    assert_eq!(after_view.funded_amount, before.funded_amount);
+    assert_eq!(after_view.status, before.status);
+    assert_eq!(after_view.target_amount, before.target_amount);
+    assert_eq!(after_view.sme, before.sme);
+
+    // Funding updates only the documented fields.
+    mint_and_fund(&client, &token, &investor, 1000);
+    let funded = client.get_escrow();
+    assert_eq!(funded.funded_amount, 1000);
+    assert_eq!(funded.status, 1);
+    assert_eq!(funded.target_amount, 1000);
+    assert_eq!(funded.sme, sme);
+
+    // Settlement and reconciliation leave the stored escrow intact.
+    token.stellar.mint(&client.address, &80i128);
+    client.settle();
+    let settled = client.get_escrow();
+    assert_eq!(settled.funded_amount, 1000);
+    assert_eq!(settled.status, 2);
+    assert_eq!(settled.target_amount, 1000);
+    assert_eq!(settled.sme, sme);
+
+    let _ = client.get_reconciliation();
+    let settled_after = client.get_escrow();
+    assert_eq!(settled_after.funded_amount, settled.funded_amount);
+    assert_eq!(settled_after.status, settled.status);
+    assert_eq!(settled_after.target_amount, settled.target_amount);
+    assert_eq!(settled_after.sme, settled.sme);
+    assert_invariant(&client, &token);
+}
+
 // ── Test: refund_batch skips zero-contribution addresses (#92) ───────────────
 
 /// `refund_batch` runs in batch mode, so an address with no recorded
