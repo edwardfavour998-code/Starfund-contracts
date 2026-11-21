@@ -904,6 +904,9 @@ pub enum EscrowError {
 
     /// [`StarfundEscrow::settle`] blocked while a legal hold is active.
     LegalHoldBlocksSettlement = 120,
+    /// [`StarfundEscrow::settle`] / [`StarfundEscrow::settle_batch`] called by an address
+    /// other than the configured SME. Settlement is SME-only per `docs/settlement-auth.md`.
+    SettlementUnauthorized = 304,
     /// [`StarfundEscrow::settle`] called before escrow reached funded status.
     SettlementNotFunded = 121,
     /// [`StarfundEscrow::settle`] called before configured maturity timestamp.
@@ -1154,6 +1157,15 @@ pub enum EscrowError {
     PerInvestorCapExceedsFundingTarget = 268,
     /// [`StarfundEscrow::raise_max_per_investor`] set a cap below the minimum contribution floor.
     PerInvestorCapBelowMinContributionFloor = 270,
+    /// A configuration mutation would leave `min_contribution_floor > max_per_investor`,
+    /// making every deposit fail either the floor or the cap. Rejected before mutation.
+    MinContributionFloorExceedsMaxPerInvestor = 301,
+    /// A configuration mutation would leave `min_contribution_floor >= funding_target`.
+    MinContributionFloorExceedsFundingTarget = 302,
+    /// [`StarfundEscrow::lower_max_per_investor`] would set the cap below the largest
+    /// existing investor contribution. Existing oversized positions are not grandfathered;
+    /// the update is rejected so the cap remains enforceable for every investor.
+    MaxPerInvestorCapBelowExistingContribution = 303,
     /// [`StarfundEscrow::raise_maturity_max_horizon`] did not strictly raise the horizon.
     HorizonNotRaised = 271,
 
@@ -10408,14 +10420,11 @@ impl StarfundEscrow {
             .get(&DataKey::DistributedPrincipal)
             .unwrap_or(0);
 
-        // In Settled status, liability includes yield coupon (settle_pool).
-        // In other statuses, liability is just the funded_amount.
-        let liability_base = if escrow.status == 2 {
-            escrow.settle_pool
-        } else {
-            escrow.funded_amount
-        };
-        let outstanding_liability = liability_base.saturating_sub(distributed).max(0);
+        // Liability is the approved calculation shared with `sweep_terminal_dust`:
+        // `max(funded_amount - distributed_principal, 0)`. `InvoiceEscrow` has no
+        // settlement-pool member (and its XDR layout must stay unchanged), so the
+        // liability is always derived from stored principal accounting.
+        let outstanding_liability = escrow.funded_amount.saturating_sub(distributed).max(0);
 
         let token_addr = Self::funding_token_or_fail(&env);
         let this = env.current_contract_address();
@@ -10607,6 +10616,60 @@ impl StarfundEscrow {
         context.map(|c| c.consumed).unwrap_or(false)
     }
 
+    /// Centralized cross-parameter configuration policy.
+    ///
+    /// Enforces the approved relation between the funding target, the minimum
+    /// contribution floor and the per-investor cap:
+    ///
+    /// ```text
+    /// funding_target > 0
+    /// min_contribution_floor <= max_per_investor   (when both are configured)
+    /// min_contribution_floor <  funding_target     (when a floor is configured)
+    /// ```
+    ///
+    /// This is a pure check: it performs no storage writes, so a rejected call
+    /// leaves configuration, events and nonces untouched. Callers must invoke it
+    /// **before** persisting any mutation.
+    fn validate_config_consistency(
+        env: &Env,
+        funding_target: i128,
+        min_contribution_floor: i128,
+        max_per_investor: i128,
+    ) {
+        ensure(env, funding_target > 0, EscrowError::TargetNotPositive);
+
+        if min_contribution_floor > 0 {
+            ensure(
+                env,
+                min_contribution_floor < funding_target,
+                EscrowError::MinContributionFloorExceedsFundingTarget,
+            );
+        }
+
+        if min_contribution_floor > 0 && max_per_investor > 0 {
+            ensure(
+                env,
+                min_contribution_floor <= max_per_investor,
+                EscrowError::MinContributionFloorExceedsMaxPerInvestor,
+            );
+        }
+    }
+
+    /// Reads the currently configured floor and cap (absent ΓçÆ `0`, meaning unset).
+    fn configured_floor_and_cap(env: &Env) -> (i128, i128) {
+        let floor: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinContributionFloor)
+            .unwrap_or(0);
+        let cap: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxPerInvestor)
+            .unwrap_or(0);
+        (floor, cap)
+    }
+
     fn pending_callback_nonces(env: &Env) -> Vec<u64> {
         if let Some(pending) = env
             .storage()
@@ -10696,6 +10759,40 @@ mod init_reentry_guard_tests {
             status: 0,
             dispute_active: false,
         }
+    }
+
+    #[test]
+    fn config_consistency_rejects_floor_above_cap() {
+        let env = Env::default();
+        with_contract(&env, || {
+            // floor 30 > cap 20 must be rejected before any mutation.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                StarfundEscrow::validate_config_consistency(&env, 100, 30, 20);
+            }));
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn config_consistency_accepts_boundary_equality() {
+        let env = Env::default();
+        with_contract(&env, || {
+            // floor == cap is the approved boundary.
+            StarfundEscrow::validate_config_consistency(&env, 100, 20, 20);
+            // floor below cap is valid.
+            StarfundEscrow::validate_config_consistency(&env, 100, 10, 20);
+        });
+    }
+
+    #[test]
+    fn config_consistency_rejects_floor_at_or_above_target() {
+        let env = Env::default();
+        with_contract(&env, || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                StarfundEscrow::validate_config_consistency(&env, 100, 100, 200);
+            }));
+            assert!(result.is_err());
+        });
     }
 
     fn with_contract<R>(env: &Env, f: impl FnOnce() -> R) -> R {

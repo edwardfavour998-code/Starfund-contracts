@@ -27,7 +27,8 @@
 13. [Read-Only Getters](#13-read-only-getters)
 14. [Admin Operations](#14-admin-operations)
 15. [Auth Flags Reference](#15-auth-flags-reference)
-16. [Security Notes](#16-security-notes)
+16. [Recovering from a Stale Simulation](#15-recovering-from-a-stale-simulation)
+17. [Security Notes](#16-security-notes)
 
 ---
 
@@ -876,7 +877,101 @@ stellar contract invoke \
 
 ---
 
-## 15. Auth Flags Reference
+## 15. Recovering from a Stale Simulation
+
+Soroban simulations are a snapshot of ledger state at a specific ledger sequence. Between the
+moment you simulate and the moment the signed transaction is submitted, the ledger can advance
+and the contract state can change — an admin nonce can be consumed, a legal hold can be set, or
+the escrow can move to a terminal status. Submitting the old signed envelope then fails with a
+stale-state or stale-nonce error.
+
+> **Never reuse a signature for changed arguments.** A signed `SorobanAuthorizationEntry` is
+> bound to the exact invocation arguments and the simulated ledger state. If any argument
+> changes (admin nonce, `new_maturity`, `new_target`, `active`, `amount`, …), the old signature
+> is invalid — re-simulate and re-sign from scratch. See
+> [`docs/escrow-indexer.md`](escrow-indexer.md) for how indexers detect stale RPC state versus
+> chainhead.
+
+### Bounded retry recipe
+
+Cap retries at **3 attempts**. If the third attempt still fails, stop and escalate — do not loop.
+
+```bash
+MAX_ATTEMPTS=3
+attempt=0
+TX_HASH=""   # set after each submit so the next attempt can check whether it landed
+
+while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
+  attempt=$((attempt + 1))
+
+  # 1. Refresh ledger state — re-query chainhead, not the cached simulation.
+  stellar contract invoke --id "$CONTRACT_ID" --network local -- get_escrow
+  stellar contract invoke --id "$CONTRACT_ID" --network local -- get_admin_nonce
+
+  # 2. If a previous attempt was submitted, check whether it already landed
+  #    before retrying. A "failed" simulation may still have committed.
+  if [ -n "$TX_HASH" ]; then
+    stellar tx fetch --network local --hash "$TX_HASH" && {
+      echo "Transaction already committed — do not retry."
+      break
+    }
+  fi
+
+  # 3. Re-simulate / build-only to get fresh footprint and auth entries.
+  stellar contract invoke \
+    --id "$CONTRACT_ID" \
+    --source admin \
+    --network local \
+    --build-only \
+    -- <entrypoint> <args...> > /tmp/invoke.xdr
+
+  # 4. Diff the invocation arguments against the previous attempt. If the admin
+  #    nonce or any lifecycle-dependent argument changed, the old signature is
+  #    stale — discard it and sign the freshly built envelope.
+  #    (Compare /tmp/invoke.xdr against the prior build; any diff means re-sign.)
+
+  # 5. Submit the freshly signed envelope and capture the hash.
+  TX_HASH=$(stellar tx sign --network local --sign-with-key admin /tmp/invoke.xdr \
+    | stellar tx send --network local)
+  echo "Submitted: $TX_HASH"
+done
+```
+
+### Scenario A — stale admin nonce
+
+A concurrent admin call (e.g. another `update_maturity` or `set_legal_hold`) consumed the nonce
+your simulation assumed.
+
+1. **Detect:** submission fails with a stale-nonce / `txBAD_SEQ`-style error.
+2. **Refresh:** re-query `get_admin_nonce` and `get_escrow` (step 1 above).
+3. **Check landed:** look up the previous `TX_HASH` (step 2). If the concurrent admin call
+   already committed, your intended change may be redundant — re-read state before proceeding.
+4. **Re-simulate:** rebuild with `--build-only` (step 3). The new build carries the current
+   nonce.
+5. **Re-sign:** the nonce changed, so the old signature is invalid. Sign the new envelope
+   (step 5). Do **not** resubmit the old XDR.
+
+### Scenario B — lifecycle transition race
+
+`settle` or `withdraw` races with a legal hold or a status change (e.g. another party already
+moved the escrow to `2` or `3`).
+
+1. **Detect:** simulation or submission fails because the status precondition no longer holds
+   (e.g. `settle` on an already-settled escrow, or a hold set after simulation).
+2. **Refresh:** re-query `get_escrow` and `get_legal_hold` (step 1).
+3. **Check landed:** if a prior `settle`/`withdraw` already committed, the escrow is terminal —
+   stop; do not retry a mutually exclusive path.
+4. **Re-simulate:** rebuild with `--build-only`. If the lifecycle argument (e.g. `--active`,
+   `--new_maturity`) changed, the invocation arguments differ.
+5. **Re-sign:** changed arguments invalidate the old signature. Sign the new envelope.
+
+> **Decision point:** after step 2, if `get_escrow` shows a terminal status (`2` or `3`) or
+> `get_legal_hold` is `true`, abort the retry loop — the intended transition is no longer valid.
+
+---
+
+## 16. Auth Flags Reference
+=======
 
 ### How `require_auth()` maps to CLI flags
 
@@ -925,7 +1020,7 @@ For local simulation, using `--source <identity>` where the identity matches the
 
 ---
 
-## 16. Security Notes
+## 17. Security Notes
 
 ### Maintainer secrets
 

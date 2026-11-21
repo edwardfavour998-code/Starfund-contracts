@@ -2372,6 +2372,167 @@ fn test_raise_max_per_investor_rejects_cap_below_minimum_contribution_floor() {
     assert_eq!(client.get_max_per_investor_cap(), Some(old_cap));
 }
 
+// ── configuration invariants across setters (#427) ─────────────────────────
+
+/// Initialize target 100, floor 10, cap 20 and assert the baseline policy.
+fn init_floor_cap_policy(
+    env: &Env,
+    client: &EscrowContractClient,
+    admin: &Address,
+    sme: &Address,
+    invoice: &str,
+    target: i128,
+    floor: i128,
+    cap: i128,
+) {
+    client.init(
+        admin,
+        &String::from_str(env, invoice),
+        sme,
+        &target,
+        &800i64,
+        &0u64,
+        &Address::generate(env),
+        &None,
+        &Address::generate(env),
+        &None,
+        &Some(floor),
+        &None,
+        &Some(cap),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+}
+
+#[test]
+fn test_raise_floor_above_cap_rejected_before_mutation() {
+    use soroban_sdk::testutils::Events as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+
+    init_floor_cap_policy(&env, &client, &admin, &sme, "INV427_F1", 100, 10, 20);
+    assert_eq!(client.get_min_contribution_floor(), 10);
+    assert_eq!(client.get_max_per_investor_cap(), Some(20));
+    assert_eq!(client.get_escrow().amount, 100);
+
+    let events_before = env.events().all();
+    let nonce_before = client.get_admin_nonce();
+
+    // Raising the floor to 30 passes the target-only bound but exceeds the cap.
+    assert_contract_error(
+        client.try_raise_min_contribution_floor(&30i128, &nonce_before),
+        EscrowError::PerInvestorCapBelowMinContributionFloor,
+    );
+
+    // Rejected call preserves configuration, events and nonce.
+    assert_eq!(client.get_min_contribution_floor(), 10);
+    assert_eq!(client.get_max_per_investor_cap(), Some(20));
+    assert_eq!(client.get_escrow().amount, 100);
+    assert_eq!(client.get_admin_nonce(), nonce_before);
+    assert_eq!(env.events().all(), events_before);
+
+    // A valid deposit still succeeds after the rejected update.
+    let inv = Address::generate(&env);
+    client.fund(&inv, &10i128);
+    assert_eq!(client.get_contribution(&inv), 10);
+}
+
+#[test]
+fn test_lower_cap_below_floor_rejected_before_mutation() {
+    use soroban_sdk::testutils::Events as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+
+    init_floor_cap_policy(&env, &client, &admin, &sme, "INV427_C1", 100, 10, 20);
+
+    let events_before = env.events().all();
+    let nonce_before = client.get_admin_nonce();
+
+    // Lowering the cap below the existing floor must be rejected.
+    assert_contract_error(
+        client.try_lower_max_per_investor(&5i128, &nonce_before),
+        EscrowError::PerInvestorCapBelowMinContributionFloor,
+    );
+
+    assert_eq!(client.get_min_contribution_floor(), 10);
+    assert_eq!(client.get_max_per_investor_cap(), Some(20));
+    assert_eq!(client.get_admin_nonce(), nonce_before);
+    assert_eq!(env.events().all(), events_before);
+
+    let inv = Address::generate(&env);
+    client.fund(&inv, &10i128);
+    assert_eq!(client.get_contribution(&inv), 10);
+}
+
+#[test]
+fn test_update_funding_target_revalidates_constraints() {
+    use soroban_sdk::testutils::Events as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+
+    init_floor_cap_policy(&env, &client, &admin, &sme, "INV427_T1", 100, 10, 20);
+
+    let events_before = env.events().all();
+    let nonce_before = client.get_admin_nonce();
+
+    // Target below the configured per-investor cap must be rejected.
+    assert_contract_error(
+        client.try_update_funding_target(&15i128, &nonce_before),
+        EscrowError::PerInvestorCapExceedsFundingTarget,
+    );
+
+    assert_eq!(client.get_escrow().amount, 100);
+    assert_eq!(client.get_max_per_investor_cap(), Some(20));
+    assert_eq!(client.get_min_contribution_floor(), 10);
+    assert_eq!(client.get_admin_nonce(), nonce_before);
+    assert_eq!(env.events().all(), events_before);
+
+    // A target that still satisfies the policy is accepted.
+    client.update_funding_target(&200i128, &nonce_before);
+    assert_eq!(client.get_escrow().amount, 200);
+
+    let inv = Address::generate(&env);
+    client.fund(&inv, &10i128);
+    assert_eq!(client.get_contribution(&inv), 10);
+}
+
+#[test]
+fn test_floor_equal_to_cap_boundary_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+
+    init_floor_cap_policy(&env, &client, &admin, &sme, "INV427_B1", 100, 10, 20);
+
+    // floor == cap is the inclusive boundary and must be accepted.
+    client.raise_min_contribution_floor(&20i128, &client.get_admin_nonce());
+    assert_eq!(client.get_min_contribution_floor(), 20);
+    assert_eq!(client.get_max_per_investor_cap(), Some(20));
+
+    // A deposit at exactly the floor/cap boundary succeeds.
+    let inv = Address::generate(&env);
+    client.fund(&inv, &20i128);
+    assert_eq!(client.get_contribution(&inv), 20);
+}
+
 #[test]
 fn test_raise_max_per_investor_emits_event() {
     use soroban_sdk::testutils::Events as _;

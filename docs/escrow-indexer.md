@@ -141,7 +141,70 @@ Do not treat `RegistryRef` as a trust anchor in risk engines without independent
 
 ---
 
-## 7) Security notes for indexers
+## 7) Bounded retry recipe: recovering from a stale RPC simulation
+
+This section is the write-side companion to the read-side failure modes in
+[section 5](#5-failure-modes-stale-rpc-vs-chainhead). A simulation is only valid against the ledger
+state it was run on; if that state moves (concurrent admin update, lifecycle transition, nonce
+consumption), the signed transaction is stale and must not be blindly resubmitted.
+
+### 7.1 Decision points (in order)
+
+1. **Detect staleness.** Compare the simulation's reported ledger with the latest accepted ledger
+   checkpoint, and compare simulated reads with fresh canonical reads. Treat the simulation as
+   stale if **any** of the following hold:
+   - simulated ledger < latest accepted ledger checkpoint;
+   - simulated `get_escrow()` snapshot != freshly polled `get_escrow()`;
+   - simulated `get_admin_nonce()` != freshly polled `get_admin_nonce()`;
+   - simulated `get_legal_hold()` or `get_version()` != freshly polled values.
+2. **Refresh ledger state.** Re-read the latest accepted ledger checkpoint, then re-poll the
+   canonical read endpoints used by the invocation: `get_escrow`, `get_admin_nonce`,
+   `get_legal_hold`, `get_version` (plus any endpoint the call depends on, e.g.
+   `get_funding_close_snapshot`).
+3. **Check for an already-committed transaction.** Before retrying, query by tx hash (and your
+   event cursor) to confirm the previous attempt did **not** land. If it is committed, stop: apply
+   the result and do not retry. A stale simulation does not imply the submission failed.
+4. **Re-simulate** against the refreshed state. Never reuse a simulation result from a different
+   ledger.
+5. **Diff invocation arguments.** Compare the new invocation arguments (nonce, target, amounts,
+   addresses, and any lifecycle-dependent fields) with the arguments that were previously signed.
+   - If **nothing** changed, the existing signatures remain valid; resubmit.
+   - If **anything** changed, **discard the old signatures** and recollect fresh signatures from
+     all required signers. Never reuse a signature over changed arguments.
+6. **Bound retries.** Cap the loop (e.g. **max 3 attempts**). On exhaustion, stop retrying and
+   surface persistent staleness as an alert (include escrow id, tx hash, attempt count, and the
+   ledger numbers observed) rather than looping indefinitely.
+
+### 7.2 Worked example: concurrent admin update + lifecycle transition
+
+Scenario: an admin submits `settle`, while a second admin concurrently transfers admin
+(`admin` event) and toggles legal hold (`legalhld` event). The `settle` simulation was run before
+both landed.
+
+- **Attempt 1 (stale simulation).** Simulated ledger `L`; latest accepted ledger is `L+2`.
+  Fresh `get_admin_nonce()` is higher than simulated (admin transfer consumed the nonce), and
+  `get_legal_hold()` / `get_version()` differ from the simulation.
+  - *Decision point 1:* stale -> proceed to refresh.
+  - *Decision point 2:* re-poll `get_escrow`, `get_admin_nonce`, `get_legal_hold`, `get_version`.
+  - *Decision point 3:* query by tx hash -> not committed, so a retry is allowed.
+  - *Decision point 4:* re-simulate against `L+2`.
+  - *Decision point 5:* nonce changed (and possibly the admin signer set) -> **discard old
+    signatures**, recollect from the current admin signers.
+  - *Decision point 6:* attempt 1 of 3.
+- **Attempt 2.** If a further admin update lands between re-simulation and submission, the same
+  checks repeat. If the nonce/arguments are unchanged, resubmit with existing signatures; if
+  changed, discard and recollect again.
+- **Attempt 3 (bound reached).** If staleness persists, stop and raise an alert. Do not keep
+  resubmitting stale nonce or stale-state transactions.
+
+For lifecycle transitions, the same recipe applies: if `settle` races with a legal-hold change,
+the refreshed `get_legal_hold()` / `get_escrow()` state may make the call revert or change its
+preconditions. Re-simulate, diff arguments, and only resubmit with signatures that match the
+final arguments.
+
+---
+
+## 8) Security notes for indexers
 
 - Unsupported token economics (fee-on-transfer/rebasing/hook tokens) are out of scope for escrow
   accounting and are expected to fail closed at transfer balance checks in

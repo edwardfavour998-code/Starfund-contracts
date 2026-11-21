@@ -191,13 +191,72 @@ fn test_partial_settle_no_auth_panics() {
 
 // ── settle ──────────────────────────────────────────────────────────────
 
-/// Once an escrow has reached maturity, settlement is permissionless (no auth required)
-/// to allow operators/admins to perform batch settlements without per-SME cross-contract signatures.
+/// Snapshot of the observable settlement state used to prove rejected calls
+/// leave status, timestamp and events untouched.
+fn settle_state(
+    env: &Env,
+    client: &crate::StarfundEscrowClient<'_>,
+) -> (u32, Option<u64>, u32) {
+    let escrow = client.get_escrow();
+    let events = env.events().all().len();
+    (escrow.status, escrow.settled_at, events)
+}
+
+/// Calling `settle` with no authorization panics at the host-level
+/// `sme_address.require_auth()` inside `load_escrow_require_sme`, and the
+/// rejected call leaves status, timestamp and events unchanged.
 #[test]
-fn test_settle_permissionless_when_mature() {
+fn test_settle_no_auth_panics() {
     let env = Env::default();
     let (client, _admin, _sme, _investor, _treasury) = setup_funded(&env);
+    let before = settle_state(&env, &client);
     env.mock_auths(&[]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.settle()));
+    assert!(result.is_err(), "expected panic with no auth, but settle succeeded");
+    assert_eq!(settle_state(&env, &client), before);
+}
+
+/// Calling `settle` with a non-SME signer panics at the host-level
+/// `require_auth` because `load_escrow_require_sme` demands the SME's
+/// signature, and the rejected call leaves state and events unchanged.
+#[test]
+fn test_settle_wrong_signer_panics() {
+    let env = Env::default();
+    let (client, _admin, _sme, _investor, _treasury) = setup_funded(&env);
+    let before = settle_state(&env, &client);
+    let stranger = Address::generate(&env);
+    env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "settle",
+            args: SorobanVec::new(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.settle()));
+    assert!(
+        result.is_err(),
+        "expected panic with wrong signer on settle, but call succeeded"
+    );
+    assert_eq!(settle_state(&env, &client), before);
+}
+
+/// The SME's signature satisfies the settlement authorization policy and
+/// transitions the escrow to Settled (status 2).
+#[test]
+fn test_settle_with_sme_succeeds() {
+    let env = Env::default();
+    let (client, _admin, sme, _investor, _treasury) = setup_funded(&env);
+    env.mock_auths(&[MockAuth {
+        address: &sme,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "settle",
+            args: SorobanVec::new(&env),
+            sub_invokes: &[],
+        },
+    }]);
     let result = client.settle();
     assert_eq!(result.escrow.status, 2u32);
 }

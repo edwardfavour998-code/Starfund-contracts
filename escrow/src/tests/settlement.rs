@@ -3221,6 +3221,343 @@ fn settle_batch_reports_failures_and_continues_settling() {
     assert_eq!(last.get_escrow().status, 2);
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// #428 — reconciliation / sweep use the approved liability calculation
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// #428: `get_reconciliation` must derive remaining liability from the approved
+/// settlement-pool calculation (not from a nonexistent `InvoiceEscrow` member).
+///
+/// Mixed-yield escrow: one base-yield investor and one tiered investor. The
+/// reconciliation's outstanding liability must equal the aggregate settlement
+/// pool minus everything already claimed.
+#[test]
+fn reconciliation_uses_approved_liability_calculation_mixed_yield() {
+    let env = Env::default();
+    let tiers = Some(SorobanVec::from_array(
+        &env,
+        [YieldTier {
+            min_lock_secs: 100u64,
+            yield_bps: 1_200i64,
+        }],
+    ));
+    let target = 2_000i128;
+    let (client, token, contract_id, _treasury) =
+        setup_tiered_pool(&env, "RECONMIX", target, 800i64, tiers);
+
+    let inv_tier = Address::generate(&env);
+    let inv_base = Address::generate(&env);
+    token.stellar.mint(&inv_tier, &1_000i128);
+    token.stellar.mint(&inv_base, &1_000i128);
+    client.fund_with_commitment(&inv_tier, &1_000i128, &100u64);
+    client.fund(&inv_base, &1_000i128);
+
+    let pool = client.get_settlement_pool();
+    token.stellar.mint(&contract_id, &(pool - target));
+    client.settle();
+
+    // Nothing claimed yet: outstanding liability == full approved pool.
+    let recon = client.get_reconciliation();
+    assert_eq!(
+        recon.outstanding_liability, pool,
+        "reconciliation liability must equal the approved settlement pool before claims"
+    );
+
+    // Partial claim: only the base-yield investor claims.
+    env.ledger().set_timestamp(200);
+    let payout_base = client.compute_investor_payout(&inv_base);
+    client.claim_investor_payout(&inv_base);
+
+    let recon_after = client.get_reconciliation();
+    assert_eq!(
+        recon_after.outstanding_liability,
+        pool - payout_base,
+        "reconciliation liability must shrink by exactly the claimed payout"
+    );
+    assert_eq!(
+        recon_after.outstanding_liability,
+        client.compute_investor_payout(&inv_tier),
+        "remaining liability must equal the unclaimed investor's approved payout"
+    );
+}
+
+/// #428: `sweep_terminal_dust` must never sweep funds that are still owed to
+/// unclaimed investors — the remaining-liability protection must be derived
+/// from the approved calculation.
+#[test]
+fn sweep_terminal_dust_preserves_remaining_liability_mixed_yield() {
+    let env = Env::default();
+    let tiers = Some(SorobanVec::from_array(
+        &env,
+        [YieldTier {
+            min_lock_secs: 100u64,
+            yield_bps: 1_200i64,
+        }],
+    ));
+    let target = 2_000i128;
+    let (client, token, contract_id, _treasury) =
+        setup_tiered_pool(&env, "SWEEPMIX", target, 800i64, tiers);
+
+    let inv_tier = Address::generate(&env);
+    let inv_base = Address::generate(&env);
+    token.stellar.mint(&inv_tier, &1_000i128);
+    token.stellar.mint(&inv_base, &1_000i128);
+    client.fund_with_commitment(&inv_tier, &1_000i128, &100u64);
+    client.fund(&inv_base, &1_000i128);
+
+    let pool = client.get_settlement_pool();
+    // Over-fund the escrow so there is genuine surplus dust above the pool.
+    let surplus = 500i128;
+    token.stellar.mint(&contract_id, &(pool - target + surplus));
+    client.settle();
+
+    // Partial claim: one investor claims, the other stays outstanding.
+    env.ledger().set_timestamp(200);
+    let payout_base = client.compute_investor_payout(&inv_base);
+    client.claim_investor_payout(&inv_base);
+
+    let outstanding = pool - payout_base;
+    let balance_before = token.stellar.balance(&contract_id);
+    assert_eq!(
+        balance_before,
+        outstanding + surplus,
+        "escrow balance must be outstanding liability plus surplus"
+    );
+
+    let swept = client.sweep_terminal_dust();
+
+    assert!(
+        swept <= surplus,
+        "sweep must not touch funds owed to unclaimed investors (swept {swept}, surplus {surplus})"
+    );
+    assert_eq!(
+        token.stellar.balance(&contract_id),
+        balance_before - swept,
+        "swept amount must match the balance delta"
+    );
+    assert!(
+        token.stellar.balance(&contract_id) >= outstanding,
+        "remaining balance must still cover the outstanding liability"
+    );
+
+    // The unclaimed investor can still be paid in full after the sweep.
+    client.claim_investor_payout(&inv_tier);
+    assert_eq!(
+        token.stellar.balance(&inv_tier),
+        client.compute_investor_payout(&inv_tier),
+        "unclaimed investor must still receive their full approved payout"
+    );
+}
+
+/// #428: sweep limits are enforced against the approved liability, so a fully
+/// claimed escrow can have its entire surplus swept (bounded by the cap).
+#[test]
+fn sweep_terminal_dust_respects_cap_after_all_claims() {
+    let env = Env::default();
+    let (client, token, contract_id, _treasury) =
+        setup_claim_env(&env, "SWEEPCAP", 1_000i128, 400i64);
+
+    let investor = Address::generate(&env);
+    token.stellar.mint(&investor, &1_000i128);
+    client.fund(&investor, &1_000i128);
+    let pool = client.get_settlement_pool();
+    token.stellar.mint(&contract_id, &(pool - 1_000i128));
+    client.settle();
+
+    client.claim_investor_payout(&investor);
+    assert_eq!(
+        client.get_reconciliation().outstanding_liability,
+        0i128,
+        "all claims settled: outstanding liability must be zero"
+    );
+
+    // Add dust above the sweep cap; the sweep must be capped.
+    let dust = MAX_DUST_SWEEP_AMOUNT + 1_000i128;
+    token.stellar.mint(&contract_id, &dust);
+    let swept = client.sweep_terminal_dust();
+
+    assert!(
+        swept <= MAX_DUST_SWEEP_AMOUNT,
+        "sweep must respect MAX_DUST_SWEEP_AMOUNT (swept {swept})"
+    );
+    assert_eq!(
+        token.stellar.balance(&contract_id),
+        dust - swept,
+        "only the swept amount may leave the escrow"
+    );
+}
+
+/// #428: the stored `InvoiceEscrow` representation must be unchanged — the
+/// persisted struct must not gain a settlement-pool member, and the liability
+/// must be obtainable from the view interface instead.
+#[test]
+fn invoice_escrow_layout_has_no_settlement_pool_member() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+    fund_to_target(&client, &env);
+
+    let escrow: InvoiceEscrow = client.get_escrow();
+    // Round-trip through XDR: the persisted layout must encode/decode cleanly.
+    let encoded = escrow.clone().to_xdr(&env, &client.address);
+    let decoded = InvoiceEscrow::from_xdr(&env, &encoded).expect("InvoiceEscrow XDR round-trip");
+    assert_eq!(decoded, escrow, "InvoiceEscrow XDR layout must be stable");
+
+    // Liability comes from the approved calculation, not from the escrow struct.
+    let pool = client.get_settlement_pool();
+    assert_eq!(
+        pool,
+        escrow.funded_amount + escrow.funded_amount * escrow.yield_bps as i128 / 10_000,
+        "approved liability must be derivable from stored escrow fields"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// #429 — SME authorization on final settlement
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// #429: `settle` with no authorization at all must be rejected and must leave
+/// status, settled timestamp and events untouched.
+#[test]
+fn settle_without_authorization_is_rejected_and_leaves_state_unchanged() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+    fund_to_target(&client, &env);
+
+    let status_before = client.get_escrow().status;
+    let settled_at_before = client.get_settled_at();
+    let events_before = env.events().all().events().len();
+
+    // No mocked auths: the SME require_auth must fail.
+    env.mock_auths(&[]);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.settle();
+    }));
+    assert!(res.is_err(), "settle must be rejected without authorization");
+
+    assert_eq!(
+        client.get_escrow().status,
+        status_before,
+        "status must be unchanged after a rejected settle"
+    );
+    assert_eq!(
+        client.get_settled_at(),
+        settled_at_before,
+        "settled timestamp must be unchanged after a rejected settle"
+    );
+    assert_eq!(
+        env.events().all().events().len(),
+        events_before,
+        "no events may be emitted by a rejected settle"
+    );
+}
+
+/// #429: `settle` signed by an unrelated address must be rejected and must
+/// leave status, settled timestamp and events untouched.
+#[test]
+fn settle_with_wrong_signer_is_rejected_and_leaves_state_unchanged() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+    fund_to_target(&client, &env);
+
+    let status_before = client.get_escrow().status;
+    let settled_at_before = client.get_settled_at();
+    let events_before = env.events().all().events().len();
+
+    // Only an unrelated address authorizes — the SME policy must reject it.
+    let impostor = Address::generate(&env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &impostor,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "settle",
+            args: ().into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.settle();
+    }));
+    assert!(res.is_err(), "settle must be rejected for a non-SME signer");
+
+    assert_eq!(
+        client.get_escrow().status,
+        status_before,
+        "status must be unchanged after a rejected settle"
+    );
+    assert_eq!(
+        client.get_settled_at(),
+        settled_at_before,
+        "settled timestamp must be unchanged after a rejected settle"
+    );
+    assert_eq!(
+        env.events().all().events().len(),
+        events_before,
+        "no events may be emitted by a rejected settle"
+    );
+}
+
+/// #429: `settle` signed by the SME succeeds and records the SME auth.
+#[test]
+fn settle_with_sme_signer_succeeds_and_records_auth() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+    fund_to_target(&client, &env);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &sme,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "settle",
+            args: ().into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let result = client.settle();
+
+    assert_eq!(result.escrow.status, 2u32, "SME-signed settle must succeed");
+    assert!(
+        env.auths().iter().any(|(addr, _)| *addr == sme),
+        "SME auth must be recorded for settle"
+    );
+}
+
+/// #429: `settle_batch` must apply the same SME policy per entry — entries the
+/// executor is not authorized to settle are reported as failures, not settled.
+#[test]
+fn settle_batch_applies_sme_policy_per_entry() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (first, first_token, first_id, _) = setup_claim_env(&env, "BATCHAUTH1", TARGET, 0);
+    let (last, last_token, last_id, _) = setup_claim_env(&env, "BATCHAUTH2", TARGET, 0);
+    for (client, token) in [(&first, &first_token), (&last, &last_token)] {
+        let investor = Address::generate(&env);
+        token.stellar.mint(&investor, &TARGET);
+        client.fund(&investor, &TARGET);
+    }
+
+    let executor = deploy(&env);
+    let escrows = soroban_sdk::vec![&env, first_id, last_id];
+
+    // No authorization for the executor: every entry must fail and stay funded.
+    env.mock_auths(&[]);
+    let outcomes = executor.settle_batch(&escrows);
+    assert_eq!(outcomes.len(), 2);
+    for i in 0..outcomes.len() {
+        assert_ne!(
+            outcomes.get(i).unwrap().status,
+            SettlementBatchStatus::Settled,
+            "entry {i} must not settle without SME authorization"
+        );
+    }
+    assert_eq!(first.get_escrow().status, 1u32);
+    assert_eq!(last.get_escrow().status, 1u32);
+}
+
 /// `SettlementResult.escrow` snapshot must have status == 2 and correct maturity.
 #[test]
 fn settlement_result_escrow_snapshot_fields() {
