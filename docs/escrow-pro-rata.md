@@ -186,6 +186,66 @@ A second call from the same investor returns early (the marker is already set) a
 re-transfer. The balance check in `transfer_funding_token_with_balance_checks` would fail a
 second transfer anyway, but the early return avoids the call entirely.
 
+## 🩺 Troubleshooting an Investor Claim
+
+### Theoretical entitlement vs. executable claim
+
+Two different questions are answered by two different views:
+
+| View | Question answered | Meaning |
+|------|-------------------|---------|
+| `compute_investor_payout(investor)` | "What is this investor *entitled* to under the pro-rata math?" | **Theoretical entitlement.** Pure arithmetic over the `FundingCloseSnapshot`; ignores lifecycle, locks, disputes, pauses, holds, prior claims and contract balance. It can be positive while a claim is not yet (or never) executable. |
+| `get_claimable_payout(investor)` | "What can this investor *claim right now*?" | **Executable claim.** Returns the amount that `claim_investor_payout` would transfer at this instant, or `0` when any guard would block the claim. |
+
+> ⚠️ A positive `compute_investor_payout` is **not** a promise that a claim will succeed.
+> Always use `get_claimable_payout` (or attempt the claim and decode the error) before
+> telling an investor their funds are ready.
+
+### Decision table
+
+Work down the table in order — it mirrors the guard ordering inside `claim_investor_payout`.
+The first row that matches explains why a claim is blocked (or why the payout is zero).
+
+| # | Failure mode | Diagnostic getter / error | Symptom | Resolution |
+|---|--------------|---------------------------|---------|------------|
+| 1 | Contract paused | `get_escrow()` → `paused == true`; error `EscrowError::PausedBlocksInvestorClaims` | Claim reverts for every investor | Wait for admin to unpause (`set_paused(false)`). |
+| 2 | Legal hold | `get_legal_hold()` → `active == true`; error `EscrowError::LegalHoldBlocksInvestorClaims` | Claim reverts for every investor | Wait for the hold to be lifted by the admin. |
+| 3 | Active dispute | `get_dispute_state()` (when present) → dispute open; error `EscrowError::DisputeBlocksInvestorClaims` | Claim reverts for every investor | Wait for dispute resolution. |
+| 4 | Not the investor / no auth | `EscrowError::Unauthorized` (auth failure on `investor.require_auth()`) | Caller cannot claim on behalf of another address | Call from the investor's own address. |
+| 5 | No contribution recorded | `get_contribution(investor)` → `0`; error `EscrowError::NoContributionToClaim` | Claim reverts for this investor only | Address never funded this escrow. |
+| 6 | Escrow not settled | `get_escrow()` → `status != 2`; error `EscrowError::EscrowNotSettled` (lifecycle guard) | Claim reverts for every investor | Wait until `settle()` / `partial_settle()` completes and `status == 2`. |
+| 7 | Commitment lock still active | `get_investor_claim_not_before(investor)` → `now < not_before`; error `EscrowError::ClaimLocked` | Claim reverts for this investor only | Retry after the returned ledger timestamp. |
+| 8 | Already claimed | `is_investor_claimed(investor)` → `true` | Second claim is a no-op (no revert, no transfer) | Nothing to do; funds were already transferred. |
+| 9 | Payout rounds to zero | `get_claimable_payout(investor)` → `0`; error `EscrowError::PayoutZero` (code 165) | Claim reverts for this investor only | Contribution too small to yield a positive payout; nothing is owed. |
+| 10 | Contract balance shortfall | `get_claimable_payout(investor)` > token balance of the escrow; transfer balance check fails inside `transfer_funding_token_with_balance_checks` | Claim reverts at the transfer step (state rolled back) | SME must repay the pool (`get_settlement_pool()`); retry after funding. |
+
+Notes:
+
+- Rows 1–3 are global gates; rows 5, 7, 9 and 10 are per-investor.
+- Rows 1–3, 5–7 and 9 surface as `EscrowError` variants; row 8 is an idempotent early return,
+  not an error.
+- `get_claimable_payout` folds rows 1–3, 5–7 and 9 into a single `0` result, so a `0` from that
+  getter means "not executable now" — use the table above to find out *which* guard applies.
+
+### Guard ordering in `claim_investor_payout`
+
+The contract evaluates guards in this order; the first failing guard determines the error:
+
+1. **Pause** — `PausedBlocksInvestorClaims`
+2. **Legal hold** — `LegalHoldBlocksInvestorClaims`
+3. **Dispute** — `DisputeBlocksInvestorClaims`
+4. **Authorization** — `investor.require_auth()` (`Unauthorized`)
+5. **Contribution** — `NoContributionToClaim` when the recorded contribution is `0`
+6. **Settled status** — lifecycle guard requiring `status == 2`
+7. **Commitment lock** — `ClaimLocked` while `now < get_investor_claim_not_before(investor)`
+8. **Prior claim** — `is_investor_claimed(investor)` → early return (idempotent no-op)
+9. **Payout > 0** — `PayoutZero` (code 165) when the computed payout is zero
+10. **Transfer** — `transfer_funding_token_with_balance_checks` (balance shortfall traps and
+    rolls back the claimed marker)
+
+Because the claimed marker is written before step 10, a failure at the transfer step leaves the
+investor unclaimed and free to retry once the contract is funded.
+
 ## 🔗 On-Chain Aggregate View: `get_settlement_pool`
 
 ```

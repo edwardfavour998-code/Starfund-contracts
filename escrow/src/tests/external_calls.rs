@@ -980,6 +980,57 @@ fn sweep_terminal_dust_after_partial_release_and_withdraw() {
     assert_eq!(client.sweep_terminal_dust(&1i128), 1i128);
 }
 
+// ── Issue #402: refund rollback after token balance-delta rejection ─────────
+
+#[test]
+fn refund_rolls_back_accounting_when_token_delta_rejected() {
+    use soroban_sdk::testutils::Events as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let investor = Address::generate(&env);
+    let fund_amount = 1_000i128;
+    let (token, _treasury) =
+        setup_cancelled_with_token(&env, &client, &admin, &sme, &investor, fund_amount);
+
+    // Make the funding token nonconforming: its outbound transfer reports a
+    // balance delta that does not match the requested amount, so the
+    // balance-delta check inside the refund transfer must reject it.
+    env.as_contract(&token.id, || {
+        env.storage()
+            .instance()
+            .set(&NonconformingTokenKey::RejectOutbound, &true);
+    });
+
+    // Snapshot all state that a failed refund must leave untouched.
+    let contribution_before = client.get_contribution(&investor);
+    let refunded_before = client.is_investor_refunded(&investor);
+    let distributed_before = client.get_distributed_principal();
+    let contract_balance_before = token.token.balance(&client.address);
+    let investor_balance_before = token.token.balance(&investor);
+    let events_before = env.events().all().events().len();
+
+    assert_eq!(contribution_before, fund_amount);
+    assert!(!refunded_before);
+
+    // Public refund entrypoint must fail because the token delta is rejected.
+    assert!(client.try_refund(&investor).is_err());
+
+    // Contribution and refund marker are unchanged.
+    assert_eq!(client.get_contribution(&investor), contribution_before);
+    assert_eq!(client.is_investor_refunded(&investor), refunded_before);
+    assert!(!client.is_investor_refunded(&investor));
+
+    // DistributedPrincipal and token balances match pre-call values.
+    assert_eq!(client.get_distributed_principal(), distributed_before);
+    assert_eq!(token.token.balance(&client.address), contract_balance_before);
+    assert_eq!(token.token.balance(&investor), investor_balance_before);
+
+    // No refund event persists.
+    assert_eq!(env.events().all().events().len(), events_before);
+}
+
 #[test]
 #[ignore = "branch-specific latent failure"]
 fn sweep_liability_floor_blocked_emits_no_dust_event() {

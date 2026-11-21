@@ -408,7 +408,15 @@ storage key; the digest at index N is unchanged.
 
 - **Capacity:** `MAX_ATTESTATION_APPEND_ENTRIES = 32`. This is a storage-growth guardrail,
   not a compliance limit. If 32 entries are insufficient, the operational playbook should
-  define a rotation policy (e.g. new escrow instance per compliance period).
+  define a rotation policy (e.g. new escrow instance per compliance period). Exactly 32
+  entries remain supported; the 33rd append retains its typed rejection
+  (`AttestationAppendLogCapacityReached`, code 51).
+
+- **Measured execution budget:** the 32-entry ceiling is backed by a reproducible budget
+  regression (see [Execution budget measurements](#execution-budget-measurements)) that
+  records CPU instructions, memory, and ledger entry size at the existing limit for append,
+  page reads, and batch revocation. The ceiling is not raised by this measurement; it
+  documents the margin available under the supported ledger budget.
 
 - **Revocation does not delete history:** `revoke_attestation_digest` writes a `true` marker
   under a separate key; the original append log entry persists unchanged. This ensures the
@@ -519,6 +527,33 @@ Attestation behavior is covered in [`escrow/src/tests/attestations.rs`](../escro
 | `test_batch_append_interleaved_with_single_appends` | Mixing single and batch appends preserves full ordered audit trail |
 | `test_batch_append_entries_are_revocable` | Batch-appended entries are independently revocable after insertion |
 | `test_batch_append_failed_call_leaves_log_unchanged` | Failed batch (over-limit or over-capacity) leaves log in its prior state |
+
+### Execution budget measurements
+
+The append-log ceiling (`MAX_ATTESTATION_APPEND_ENTRIES = 32`) is measured, not assumed.
+A budget regression in [`escrow/src/tests/attestations.rs`](../escrow/src/tests/attestations.rs)
+exercises the worst-case scenarios at exactly 32 entries and records CPU instructions,
+memory bytes, and ledger entry size against realistic ledger limits. The scenarios are:
+
+| Scenario | What is measured |
+|---|---|
+| `test_budget_append_at_max_entries` | Single append that fills the log to exactly 32 entries (deserialize + push + serialize) |
+| `test_budget_append_33rd_rejected` | 33rd append: typed rejection `AttestationAppendLogCapacityReached` (51), no state mutation |
+| `test_budget_page_read_at_max_entries` | `get_revoked_attestation_digests` page read over a full 32-entry log at `MAX_ATTESTATION_READ_PAGE` |
+| `test_budget_batch_revoke_at_max_entries` | `revoke_attestation_digests` over all 32 entries in one batch |
+
+Each test asserts the measured CPU instruction count, memory footprint, and serialized
+ledger entry size stay within the supported ledger budget, so a regression that erodes the
+execution margin fails CI rather than surfacing on-chain. The measurements confirm:
+
+- **Exactly 32 entries remain supported** — the append that fills the log to 32 succeeds.
+- **The 33rd append retains its typed rejection** — `AttestationAppendLogCapacityReached`
+  (code 51), with the log left unchanged.
+- **Page reads and batch revocation at 32 entries** stay within the measured CPU, memory,
+  and ledger entry size margins.
+
+Re-run the budget tests with the pinned SDK (`cargo test -p escrow budget`) to reproduce
+the recorded figures after any change to the append-log storage layout.
 
 ### Batch revocation (`revoke_attestation_digests`)
 

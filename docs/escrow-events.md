@@ -38,6 +38,10 @@ Emitted when a pending fee schedule is promoted at or after its activation ledge
 - `schedule` (`FeeSchedule`) — newly active schedule.
 - `previous` (`Option<FeeSchedule>`) — schedule active before promotion, if any.
 
+**Emission semantics:** `FeeScheduleActivated` is emitted **only** by the mutating
+`activate_fee_schedule` entrypoint. It is never emitted by a getter, and no event is
+promised from any read-only call. See [Projected vs. Persisted Fee Schedule State](#-projected-vs-persisted-fee-schedule-state).
+
 ### `EscrowInitialized`
 Emitted once by `init()`. Carries the escrow snapshot plus immutable bound references so
 indexers can register `funding_token`, `treasury`, and optional `registry` without follow-up reads.
@@ -423,6 +427,71 @@ Emitted by `execute_callback` when a registered cross-contract callback is succe
 **Data Payload:**
 - `nonce` (u64): invocation nonce consumed by the callback.
 - `phase` (u32): lifecycle phase executed by the callback.
+
+### `CallbackCancelledEvent`
+Emitted by `cancel_callback` when an admin retires an obsolete pending callback registration.
+The pending index entry for the callback is removed; other registered callbacks are left unchanged.
+
+**Topics:**
+1. `cb_cncl` (Symbol)
+2. `invoice_id` (Symbol)
+3. `origin` (Address)
+
+**Data Payload:**
+- `nonce` (u64): invocation nonce of the cancelled callback.
+- `phase` (u32): lifecycle phase the cancelled callback was registered for.
+
+**Notes:**
+- Only the admin may cancel a callback; unauthorized callers are rejected.
+- After cancellation the callback can no longer execute: a later `execute_callback`
+  for the same `origin`/`phase`/`nonce` fails with the contract's callback-not-found error.
+- Cancellation is per-callback; other pending registrations remain active and executable.
+
+---
+
+## 🔮 Projected vs. Persisted Fee Schedule State
+
+Fee schedule reads and fee schedule activation are **two separate concerns**:
+
+- **Projected (read-only) view.** Getters such as `get_active_fee_schedule` and
+  `get_pending_fee_schedule` compute a *projection* from stored state plus the current
+  ledger. `get_active_fee_schedule` returns the pending schedule once its activation
+  ledger has been reached, even if no transaction has promoted it yet. This projection is
+  a convenience for callers; it does **not** mutate storage and does **not** emit events.
+- **Persisted (mutating) state.** The stored active schedule only changes when
+  `activate_fee_schedule` is submitted. That call promotes the pending schedule, writes
+  the new active value, and emits `FeeScheduleActivated`. `activate_fee_schedule` is
+  permissionless: anyone may submit it once the activation ledger is reached.
+
+Because the projection can advance while the persisted state (and therefore the event
+stream) has not, an **event-only consumer can lag the projected active view**. A schedule
+whose activation ledger has passed is *due* but not yet *activated* until a transaction
+calls `activate_fee_schedule`.
+
+### Timeline: due schedule with no activation transaction
+
+| Step | Ledger / action | Persisted active schedule | `get_active_fee_schedule` projection | Events emitted |
+|------|-----------------|---------------------------|--------------------------------------|----------------|
+| 1 | Admin calls `submit_fee_schedule` with `activation_ledger = L` | unchanged (old schedule) | old schedule | `FeeScheduleSubmitted` |
+| 2 | Ledger advances to `L` (no transaction) | unchanged (old schedule) | **new schedule** (due) | none |
+| 3 | Indexer calls `get_active_fee_schedule` | unchanged (old schedule) | **new schedule** (due) | none — getters emit nothing |
+| 4 | Anyone calls `activate_fee_schedule` at or after `L` | **new schedule** | new schedule | `FeeScheduleActivated` |
+
+Between steps 2 and 4 the projection and the persisted state disagree. No event marks
+the transition at step 2, because nothing was written on-chain.
+
+### Indexer guidance
+
+- Do **not** assume a `FeeScheduleActivated` event will arrive merely because the
+  activation ledger has passed. The event only exists once `activate_fee_schedule` runs.
+- When a `FeeScheduleSubmitted` event carries an `activation_ledger`, schedule a poll of
+  `get_active_fee_schedule` at (or after) that ledger to learn the projected schedule.
+- To make the projected schedule authoritative and observable, submit the permissionless
+  `activate_fee_schedule` call once the activation ledger is reached. This persists the
+  change and emits `FeeScheduleActivated`, which other event-only consumers can rely on.
+- Treat `get_active_fee_schedule` / `get_pending_fee_schedule` as read-only projections:
+  they never emit events, and their results may differ from the last persisted activation
+  until `activate_fee_schedule` is called.
 
 ---
 

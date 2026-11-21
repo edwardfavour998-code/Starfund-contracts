@@ -401,3 +401,181 @@ fn raise_min_contribution_floor_rejects_when_not_open() {
         EscrowError::FloorRaiseNotOpen,
     );
 }
+
+// ── #408: cumulative deposit provenance ─────────────────────────────────────
+
+/// A legacy position with only a contribution (no cumulative key) is reported as a
+/// fallback lower bound, while an investor with a cumulative key is reported as recorded —
+/// even when both numeric totals are equal.
+#[test]
+fn total_deposited_provenance_distinguishes_fallback_from_recorded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let fx = init_escrow(&env);
+    let legacy = Address::generate(&env);
+    let recorded = Address::generate(&env);
+    seed_investors(&fx, &[legacy.clone(), recorded.clone()], &[1_000, 1_000]);
+    let client = &fx.client;
+
+    // Give the recorded investor an explicit cumulative key equal to its contribution.
+    env.as_contract(&fx.contract, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalDeposited(recorded.clone()), &1_000i128);
+    });
+
+    // The existing numeric getter is unchanged and reports equal values.
+    assert_eq!(client.get_total_deposited(&legacy), 1_000i128);
+    assert_eq!(client.get_total_deposited(&recorded), 1_000i128);
+
+    let legacy_view = client.get_total_deposited_with_provenance(&legacy);
+    let recorded_view = client.get_total_deposited_with_provenance(&recorded);
+
+    assert_eq!(legacy_view.total, 1_000i128);
+    assert_eq!(recorded_view.total, 1_000i128);
+    assert_ne!(legacy_view.provenance, recorded_view.provenance);
+    assert_eq!(
+        legacy_view.provenance,
+        crate::DepositProvenance::Fallback
+    );
+    assert_eq!(
+        recorded_view.provenance,
+        crate::DepositProvenance::Recorded
+    );
+}
+
+/// An account with no position at all is explicitly identified as unknown.
+#[test]
+fn total_deposited_provenance_identifies_unknown_account() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let fx = init_escrow(&env);
+    seed_investors(&fx, &[Address::generate(&env)], &[1_000]);
+    let client = &fx.client;
+
+    let stranger = Address::generate(&env);
+    let view = client.get_total_deposited_with_provenance(&stranger);
+
+    assert_eq!(view.total, 0i128);
+    assert_eq!(view.provenance, crate::DepositProvenance::Unknown);
+}
+
+// ── #409: explicit funding record pagination continuation ────────────────────
+
+/// Seed an `InvestorIndex` with explicit slots, including zero-balance (sparse) entries.
+///
+/// `slots[i]` is the address at index `i`; a slot whose contribution is zero is a dead
+/// entry that `get_funding_records` filters out but which still occupies index space.
+fn seed_sparse_index(fx: &Fixture<'_>, slots: &[Address], contributions: &[i128]) {
+    let env = fx.client.env.clone();
+    let mut total = 0i128;
+    for (inv, amount) in slots.iter().zip(contributions.iter()) {
+        if *amount > 0 {
+            total += *amount;
+            env.as_contract(&fx.contract, || {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::InvestorContribution(inv.clone()), amount);
+            });
+        }
+    }
+
+    env.as_contract(&fx.contract, || {
+        let mut escrow: crate::InvoiceEscrow =
+            env.storage().instance().get(&DataKey::Escrow).unwrap();
+        escrow.funded_amount = total;
+        if total >= escrow.funding_target {
+            escrow.status = 1;
+        }
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+
+        let mut index: soroban_sdk::Vec<Address> =
+            soroban_sdk::Vec::new(&env);
+        for inv in slots.iter() {
+            index.push_back(inv.clone());
+        }
+        env.storage()
+            .instance()
+            .set(&keys::investor_index(), &index);
+        env.storage()
+            .instance()
+            .set(&DataKey::UniqueFunderCount, &(slots.len() as u32));
+    });
+}
+
+/// A wholly empty filtered page still carries a continuation, and concatenating pages
+/// visits every live record exactly once.
+#[test]
+fn funding_records_page_carries_continuation_across_empty_middle_page() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let fx = init_escrow(&env);
+    let client = &fx.client;
+
+    // Slots: live, dead, dead, live, dead, live — a wholly empty middle page of size 2.
+    let live_a = Address::generate(&env);
+    let dead_1 = Address::generate(&env);
+    let dead_2 = Address::generate(&env);
+    let live_b = Address::generate(&env);
+    let dead_3 = Address::generate(&env);
+    let live_c = Address::generate(&env);
+    seed_sparse_index(
+        &fx,
+        &[
+            live_a.clone(),
+            dead_1,
+            dead_2,
+            live_b.clone(),
+            dead_3,
+            live_c.clone(),
+        ],
+        &[1_000, 0, 0, 1_000, 0, 1_000],
+    );
+
+    // First page: one live record, continuation present.
+    let page0 = client.get_funding_records_page(&0u32, &2u32);
+    assert_eq!(page0.records.len(), 1);
+    assert_eq!(page0.records.get(0).unwrap().investor, live_a);
+    assert!(!page0.done);
+    assert!(page0.next_offset > 0u32);
+
+    // Second page: wholly empty, but must still carry a continuation.
+    let page1 = client.get_funding_records_page(&page0.next_offset, &2u32);
+    assert_eq!(page1.records.len(), 0);
+    assert!(!page1.done);
+    assert!(page1.next_offset > page0.next_offset);
+
+    // Walk to completion, collecting every live record exactly once.
+    let mut seen: Vec<Address> = Vec::new();
+    let mut offset = page1.next_offset;
+    let mut guard = 0u32;
+    loop {
+        let page = client.get_funding_records_page(&offset, &2u32);
+        for record in page.records.iter() {
+            seen.push(record.investor.clone());
+        }
+        if page.done {
+            break;
+        }
+        assert!(page.next_offset > offset);
+        offset = page.next_offset;
+        guard += 1;
+        assert!(guard < 100, "pagination did not terminate");
+    }
+
+    // The first page's record plus the tail must cover every live investor once.
+    let mut all: Vec<Address> = Vec::new();
+    all.push_back(live_a.clone());
+    for inv in seen.iter() {
+        all.push_back(inv.clone());
+    }
+    assert_eq!(all.len(), 3);
+    for live in [&live_a, &live_b, &live_c] {
+        let count = all.iter().filter(|i| *i == live).count();
+        assert_eq!(count, 1, "live record visited exactly once");
+    }
+
+    // The legacy getter still returns the same live set.
+    let legacy = client.get_funding_records(&0u32, &50u32);
+    assert_eq!(legacy.len(), 3);
+}

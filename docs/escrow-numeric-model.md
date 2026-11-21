@@ -72,6 +72,56 @@ In status **cancelled** (4), the following invariants hold for all refund orderi
 
 These properties are validated in `escrow/src/tests/properties.rs` (`prop_refund_conservation_never_exceeds_funded_principal`).
 
+## Worked payout examples
+
+`calculate_investor_payout` (see [`escrow/src/lib.rs`](../escrow/src/lib.rs)) computes an investor's settlement payout with integer arithmetic only, in this order:
+
+```text
+coupon       = total_principal × yield_bps / 10_000   (floor division)   (1)
+settle_pool  = total_principal + coupon                                  (2)
+gross_payout = contribution × settle_pool / total_principal (floor)      (3)
+```
+
+Both divisions are integer floor divisions: any fractional remainder is discarded, never rounded up. There is **no minimum-coupon rule** — a coupon that floors to `0` is a valid result and yields a payout equal to the investor's principal. There is also **no annualization or time-based accrual**: `yield_bps` is applied once as a flat rate over the whole principal, regardless of how long funds were locked or when settlement occurs. The implementation does not read timestamps, lock durations, or any period length when computing the coupon.
+
+Each example below states the principal, the bps, the intermediate product and division result, and the final payout. All values are in the token's smallest unit. Each result was cross-checked with independent integer arithmetic.
+
+### Example (a): zero configured yield
+
+- `total_principal = 1_000_000`
+- `yield_bps = 0`
+- `contribution = 1_000_000` (single investor funding the whole escrow)
+- Step (1): `coupon = 1_000_000 × 0 / 10_000 = 0 / 10_000 = 0`
+- Step (2): `settle_pool = 1_000_000 + 0 = 1_000_000`
+- Step (3): `gross_payout = 1_000_000 × 1_000_000 / 1_000_000 = 1_000_000`
+- **Final payout: `1_000_000`** (equal to principal; coupon is exactly zero)
+
+### Example (b): positive yield rounding below one base unit
+
+- `total_principal = 1_000_000`
+- `yield_bps = 1` (0.01%)
+- `contribution = 1_000_000` (single investor funding the whole escrow)
+- Step (1): `coupon = 1_000_000 × 1 / 10_000 = 1_000_000 / 10_000 = 100` — here the coupon is a whole number, so use a smaller principal to show the floor-to-zero case:
+- `total_principal = 9_999`
+- `yield_bps = 1`
+- `contribution = 9_999`
+- Step (1): intermediate product `9_999 × 1 = 9_999`; `coupon = 9_999 / 10_000 = 0` (floor division discards the remainder `9_999`)
+- Step (2): `settle_pool = 9_999 + 0 = 9_999`
+- Step (3): `gross_payout = 9_999 × 9_999 / 9_999 = 9_999`
+- **Final payout: `9_999`** (coupon floors to `0`, so payout equals principal — no minimum coupon is added)
+
+### Example (c): exact whole-unit coupon
+
+- `total_principal = 1_000_000`
+- `yield_bps = 500` (5%)
+- `contribution = 1_000_000` (single investor funding the whole escrow)
+- Step (1): intermediate product `1_000_000 × 500 = 500_000_000`; `coupon = 500_000_000 / 10_000 = 50_000` (exact, no remainder)
+- Step (2): `settle_pool = 1_000_000 + 50_000 = 1_050_000`
+- Step (3): `gross_payout = 1_000_000 × 1_050_000 / 1_000_000 = 1_050_000`
+- **Final payout: `1_050_000`** (principal `1_000_000` + coupon `50_000`)
+
+For a partial investor in example (c), e.g. `contribution = 250_000`, step (3) gives `250_000 × 1_050_000 / 1_000_000 = 262_500_000_000 / 1_000_000 = 262_500`, i.e. a pro-rata share of the same `settle_pool` with floor rounding applied per investor.
+
 ## Integration Guidance
 
 - Off-chain callers should validate amount and lock-duration inputs before submitting transactions, especially when simulating near integer limits.

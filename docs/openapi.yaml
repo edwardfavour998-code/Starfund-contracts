@@ -160,6 +160,12 @@ components:
 
     InitEscrowRequest:
       type: object
+      description: |
+        REST request body for `POST /escrow`. This is an adapter over the
+        contract entry point `StarfundEscrow.init` in `escrow/src/lib.rs`; it is
+        not a 1:1 mirror of the contract arguments. The complete mapping of
+        every contract init argument to a REST field, a server-side default, or
+        an explicit "unsupported" marker is given in `x-contract-mapping` below.
       required:
         - invoice_id
         - sme_address
@@ -173,7 +179,11 @@ components:
         sme_address:
           $ref: "#/components/schemas/StellarAddress"
         buyer_address:
-          $ref: "#/components/schemas/StellarAddress"
+          allOf:
+            - $ref: "#/components/schemas/StellarAddress"
+          description: |
+            Buyer (payer) address. Translated by the API adapter to the contract
+            argument `payer` — the field name differs between REST and contract.
         amount:
           type: integer
           format: int64
@@ -190,6 +200,84 @@ components:
           format: int64
           minimum: 1
           example: 1000
+      x-contract-mapping:
+        contract: "StarfundEscrow.init (escrow/src/lib.rs)"
+        description: |
+          Checked-in REST-to-contract adapter mapping. One row per argument of
+          the contract init signature. `source` is one of:
+          - `rest` — taken directly from the REST request body field named in `rest_field`
+          - `translated` — taken from a REST field but renamed/transformed for the contract
+          - `default` — not present in the REST schema; the adapter supplies `default`
+          - `unsupported` — cannot be set through the REST API; the adapter never sets it
+        arguments:
+          - contract_arg: invoice_id
+            source: rest
+            rest_field: invoice_id
+            rule: "Passed through unchanged (Soroban Symbol, max 12 chars)."
+          - contract_arg: admin
+            source: default
+            rest_field: null
+            default: "Authenticated caller's address (derived from the JWT subject)."
+            rule: "Not accepted from the request body; the adapter sets admin to the authenticated caller."
+          - contract_arg: sme_address
+            source: rest
+            rest_field: sme_address
+            rule: "Passed through unchanged."
+          - contract_arg: payer
+            source: translated
+            rest_field: buyer_address
+            rule: "buyer_address -> payer. The REST field is renamed to the contract argument payer; no other transformation."
+          - contract_arg: amount
+            source: rest
+            rest_field: amount
+            rule: "Passed through unchanged; widened from JSON int64 to contract i128."
+          - contract_arg: funding_target
+            source: default
+            rest_field: null
+            default: "Equal to amount."
+            rule: "Not accepted from the request body; the adapter sets funding_target = amount at init."
+          - contract_arg: yield_bps
+            source: rest
+            rest_field: yield_bps
+            rule: "Passed through unchanged (0–10000)."
+          - contract_arg: maturity
+            source: rest
+            rest_field: maturity
+            rule: "Passed through unchanged (Unix seconds)."
+          - contract_arg: status
+            source: default
+            rest_field: null
+            default: 0
+            rule: "Not accepted from the request body; the contract initialises status to 0 (open)."
+          - contract_arg: funded_amount
+            source: default
+            rest_field: null
+            default: 0
+            rule: "Not accepted from the request body; the contract initialises funded_amount to 0."
+          - contract_arg: dispute_active
+            source: default
+            rest_field: null
+            default: false
+            rule: "Not accepted from the request body; the contract initialises dispute_active to false."
+          - contract_arg: legal_hold
+            source: default
+            rest_field: null
+            default: false
+            rule: "Not accepted from the request body; the contract initialises legal_hold to false."
+          - contract_arg: nonce
+            source: default
+            rest_field: null
+            default: 0
+            rule: "Not accepted from the request body; the contract initialises the rotation nonce to 0."
+          - contract_arg: token
+            source: unsupported
+            rest_field: null
+            default: null
+            rule: "Not settable through the REST API; the token/asset is fixed by server configuration and cannot be chosen per request."
+        unsupported_notes: |
+          Any contract init argument not listed above is intentionally unsupported
+          through the REST API. The adapter rejects unknown request body fields
+          rather than silently ignoring them.
 
     FundEscrowRequest:
       type: object

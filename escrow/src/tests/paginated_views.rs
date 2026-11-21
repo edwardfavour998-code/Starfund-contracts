@@ -90,26 +90,13 @@ fn do_init(
     token: &Address,
     treasury: &Address,
 ) {
-    client.init(
-        admin,
-        &soroban_sdk::String::from_str(env, "INV_PG_001"),
-        sme,
-        &100_000_000_000i128,
-        &800i64,
-        &0u64,
-        token,
-        &None,
-        treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    super::TestConfig::new(env)
+        .admin(admin)
+        .sme(sme)
+        .token(token)
+        .treasury(treasury)
+        .invoice_id("INV_PG_001")
+        .init(client);
 }
 
 // ── get_investors ─────────────────────────────────────────────────────────────
@@ -420,6 +407,12 @@ fn get_allowlisted_investors_excludes_revoked_addresses() {
 }
 
 // ── get_revoked_attestation_digests ───────────────────────────────────────────
+//
+// Attestation storage and mutation helpers now live in the private
+// `crate::attestation` module. The public entry points exercised here
+// (`append_attestation_digest`, `revoke_attestation_digests`,
+// `get_attestation_digests`, `get_revoked_attestation_digests`) are unchanged
+// wrappers, so these tests remain valid ABI-level regressions.
 
 fn setup_attestation_escrow(env: &Env) -> (crate::StarfundEscrowClient<'_>, Address) {
     let client = super::deploy(env);
@@ -471,12 +464,10 @@ fn get_revoked_attestation_digests_zero_limit_returns_empty() {
     client.append_attestation_digest(&digest);
     client.revoke_attestation_digests(&soroban_sdk::vec![&env, 0u32]);
     // Zero page limits are rejected with a typed read-boundary error.
-    let expected = crate::EscrowError::AttestationReadLimitZero as u32;
-    match client.try_get_revoked_attestation_digests(&0, &0) {
-        Err(Ok(error)) => assert_eq!(error, soroban_sdk::Error::from_contract_error(expected)),
-        Err(Err(soroban_sdk::InvokeError::Contract(code))) => assert_eq!(code, expected),
-        other => panic!("expected AttestationReadLimitZero, got {other:?}"),
-    }
+    super::assert_contract_error(
+        client.try_get_revoked_attestation_digests(&0, &0),
+        crate::EscrowError::AttestationReadLimitZero,
+    );
 }
 
 #[test]
@@ -516,7 +507,8 @@ fn get_revoked_attestation_digests_page_of_revoked_entries() {
         client.append_attestation_digest(&digest);
     }
 
-    // Revoke indices 1 and 3
+    // Revoke indices 1 and 3 (batch path shares index validation with the
+    // single-digest path inside the attestation module).
     client.revoke_attestation_digests(&soroban_sdk::vec![&env, 1u32, 3u32]);
 
     // Full scan from start=0
@@ -576,12 +568,10 @@ fn get_attestation_digests_zero_limit_returns_typed_error() {
     let digest = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
     client.append_attestation_digest(&digest);
 
-    let expected = crate::EscrowError::AttestationReadLimitZero as u32;
-    match client.try_get_attestation_digests(&0, &0) {
-        Err(Ok(error)) => assert_eq!(error, soroban_sdk::Error::from_contract_error(expected)),
-        Err(Err(soroban_sdk::InvokeError::Contract(code))) => assert_eq!(code, expected),
-        other => panic!("expected AttestationReadLimitZero, got {other:?}"),
-    }
+    super::assert_contract_error(
+        client.try_get_attestation_digests(&0, &0),
+        crate::EscrowError::AttestationReadLimitZero,
+    );
 }
 
 /// `get_attestation_digests` with limit > MAX_ATTESTATION_READ_PAGE must revert
@@ -597,12 +587,10 @@ fn get_attestation_digests_limit_too_large_returns_typed_error() {
 
     // MAX_ATTESTATION_READ_PAGE + 1 must be rejected.
     let over_limit = crate::MAX_ATTESTATION_READ_PAGE + 1;
-    let expected = crate::EscrowError::AttestationReadLimitTooLarge as u32;
-    match client.try_get_attestation_digests(&0, &over_limit) {
-        Err(Ok(error)) => assert_eq!(error, soroban_sdk::Error::from_contract_error(expected)),
-        Err(Err(soroban_sdk::InvokeError::Contract(code))) => assert_eq!(code, expected),
-        other => panic!("expected AttestationReadLimitTooLarge, got {other:?}"),
-    }
+    super::assert_contract_error(
+        client.try_get_attestation_digests(&0, &over_limit),
+        crate::EscrowError::AttestationReadLimitTooLarge,
+    );
 }
 
 /// `get_attestation_digests` with a valid limit within bounds returns entries.
@@ -651,31 +639,48 @@ fn get_attestation_digests_and_revoked_enforce_same_limit_rules() {
     client.revoke_attestation_digests(&soroban_sdk::vec![&env, 0u32]);
 
     let over = crate::MAX_ATTESTATION_READ_PAGE + 1;
-    let too_large = crate::EscrowError::AttestationReadLimitTooLarge as u32;
 
     // Both must reject limit > MAX.
-    match client.try_get_attestation_digests(&0, &over) {
-        Err(Ok(e)) => assert_eq!(e, soroban_sdk::Error::from_contract_error(too_large)),
-        Err(Err(soroban_sdk::InvokeError::Contract(c))) => assert_eq!(c, too_large),
-        other => panic!("get_attestation_digests: expected TooLarge, got {other:?}"),
-    }
-    match client.try_get_revoked_attestation_digests(&0, &over) {
-        Err(Ok(e)) => assert_eq!(e, soroban_sdk::Error::from_contract_error(too_large)),
-        Err(Err(soroban_sdk::InvokeError::Contract(c))) => assert_eq!(c, too_large),
-        other => panic!("get_revoked_attestation_digests: expected TooLarge, got {other:?}"),
-    }
-
-    let zero_err = crate::EscrowError::AttestationReadLimitZero as u32;
+    super::assert_contract_error(
+        client.try_get_attestation_digests(&0, &over),
+        crate::EscrowError::AttestationReadLimitTooLarge,
+    );
+    super::assert_contract_error(
+        client.try_get_revoked_attestation_digests(&0, &over),
+        crate::EscrowError::AttestationReadLimitTooLarge,
+    );
 
     // Both must reject limit == 0.
-    match client.try_get_attestation_digests(&0, &0) {
-        Err(Ok(e)) => assert_eq!(e, soroban_sdk::Error::from_contract_error(zero_err)),
-        Err(Err(soroban_sdk::InvokeError::Contract(c))) => assert_eq!(c, zero_err),
-        other => panic!("get_attestation_digests: expected Zero, got {other:?}"),
+    super::assert_contract_error(
+        client.try_get_attestation_digests(&0, &0),
+        crate::EscrowError::AttestationReadLimitZero,
+    );
+    super::assert_contract_error(
+        client.try_get_revoked_attestation_digests(&0, &0),
+        crate::EscrowError::AttestationReadLimitZero,
+    );
+}
+
+/// After the attestation-module refactor, single and batch revoke operations
+/// must share index validation: an out-of-bounds index in a batch is rejected
+/// exactly as it would be for a single revoke, and the log is left unchanged.
+#[test]
+fn revoke_attestation_digests_batch_shares_index_validation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup_attestation_escrow(&env);
+
+    // Append 2 digests → valid indices are 0 and 1.
+    for seed in 0u8..2 {
+        let digest = soroban_sdk::BytesN::from_array(&env, &[seed; 32]);
+        client.append_attestation_digest(&digest);
     }
-    match client.try_get_revoked_attestation_digests(&0, &0) {
-        Err(Ok(e)) => assert_eq!(e, soroban_sdk::Error::from_contract_error(zero_err)),
-        Err(Err(soroban_sdk::InvokeError::Contract(c))) => assert_eq!(c, zero_err),
-        other => panic!("get_revoked_attestation_digests: expected Zero, got {other:?}"),
-    }
+
+    // Batch containing an out-of-bounds index must fail.
+    let result = client.try_revoke_attestation_digests(&soroban_sdk::vec![&env, 0u32, 5u32]);
+    assert!(result.is_err(), "out-of-bounds batch index must be rejected");
+
+    // No entries should have been revoked by the failed batch.
+    let revoked = client.get_revoked_attestation_digests(&0, &10);
+    assert_eq!(revoked.len(), 0);
 }

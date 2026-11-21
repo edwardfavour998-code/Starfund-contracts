@@ -7,8 +7,20 @@ description = "StarFund invoice escrow contract - holds funds until settlement"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Feature boundary:
+# - `testutils` is a TEST-ONLY feature. It enables native soroban-sdk facilities
+#   (e.g. `soroban-sdk/testutils`) that are required for unit/integration tests
+#   but must NEVER be enabled for production WASM builds.
+# - Production builds use the default feature set (no `testutils`), so the
+#   resolved production dependency graph excludes native test-only facilities.
+# - Tests get `testutils` via the `[dev-dependencies]` entry below, which pulls
+#   in `soroban-sdk` with the `testutils` feature for test targets only. This
+#   keeps the production artifact isolated from test-only dependencies.
+# - Do not add `testutils` to `[dependencies]` or to `default` features, and do
+#   not make production code paths depend on testutils-gated APIs.
 [features]
 testutils = ["soroban-sdk/testutils"]
+fixtures = ["testutils"]
 
 [dependencies]
 soroban-sdk = "25.0"

@@ -7,7 +7,7 @@
 //   4. negative or blank amount — non-positive amounts are rejected before scale check
 //   5. token scale changes after funding — second funder is validated against the original scale
 
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Events as _};
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token::TokenInterface, Address, Env, MuxedAddress,
 };
@@ -70,6 +70,223 @@ fn mint_scale_token(env: &Env, token_id: &Address, investor: &Address, amount: i
             .persistent()
             .set(investor, &(balance + amount));
     });
+}
+
+// ---------------------------------------------------------------------------
+// Decimal metadata failure fixtures (issue #418)
+// ---------------------------------------------------------------------------
+//
+// `init` reads the live SEP-41 `decimals()` metadata from the funding token and
+// compares it against the caller-supplied `token_decimals`.  When that metadata
+// is unusable the call must fail *before* any escrow state is persisted: the
+// escrow record and the version key stay unset and no init event is emitted.
+//
+// The public failure behavior is deliberately unspecified at the error-code
+// level.  A missing/wrong-typed/erroring `decimals()` may surface either as a
+// contract error or as a host invocation failure (the SEP-41 cross-contract
+// call itself traps).  These tests therefore only assert that `init` fails and
+// that nothing was persisted — they do NOT assert an invented typed code.
+
+/// Token whose `decimals()` returns a well-formed `u32` that does not match the
+/// configured `token_decimals`.  This is the ordinary mismatch path.
+#[contract]
+struct MismatchedDecimalsToken;
+
+#[contractimpl]
+impl TokenInterface for MismatchedDecimalsToken {
+    fn balance(env: Env, id: Address) -> i128 {
+        env.storage().persistent().get(&id).unwrap_or(0)
+    }
+
+    fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
+        from.require_auth();
+        let to = to.address();
+        let from_balance = Self::balance(env.clone(), from.clone());
+        let to_balance = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .persistent()
+            .set(&from, &(from_balance - amount));
+        env.storage().persistent().set(&to, &(to_balance + amount));
+    }
+
+    fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 {
+        0
+    }
+
+    fn approve(_env: Env, _from: Address, _spender: Address, _amount: i128, _exp: u32) {}
+
+    fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {}
+
+    fn burn(_env: Env, _from: Address, _amount: i128) {}
+
+    fn burn_from(_env: Env, _spender: Address, _from: Address, _amount: i128) {}
+
+    /// Always reports 7 decimals regardless of what the caller configured.
+    fn decimals(_env: Env) -> u32 {
+        7
+    }
+
+    fn name(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "MismatchedToken")
+    }
+
+    fn symbol(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "MISMATCH")
+    }
+}
+
+/// Token whose `decimals()` returns the wrong ABI type (`i128` instead of `u32`).
+/// The SEP-41 cross-contract call cannot decode the return value, so `init`
+/// fails with a host invocation failure rather than a typed contract error.
+#[contract]
+struct WrongTypeDecimalsToken;
+
+#[contractimpl]
+impl WrongTypeDecimalsToken {
+    /// Deliberately the wrong return type for SEP-41 `decimals`.
+    pub fn decimals(_env: Env) -> i128 {
+        7
+    }
+}
+
+/// Token whose `decimals()` traps with a contract error.  The SEP-41 call
+/// propagates the failure out of `init`.
+#[contract]
+struct ErroringDecimalsToken;
+
+#[contractimpl]
+impl ErroringDecimalsToken {
+    pub fn decimals(_env: Env) -> u32 {
+        panic!("decimals metadata unavailable")
+    }
+}
+
+/// Assert that `init` failed and that no initialization state was persisted.
+///
+/// We inspect storage via the public `get_escrow` accessor (which must fail
+/// because the escrow record was never written) and confirm that no events were
+/// emitted by the escrow contract during the failed `init`.
+fn assert_init_failed_without_persisting(
+    env: &Env,
+    client: &crate::StarfundEscrowClient,
+    result: Result<(), Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+) {
+    // The call must fail.  We accept either a contract error or a host
+    // invocation failure — the exact shape is not part of the public contract.
+    assert!(
+        result.is_err(),
+        "init must fail when token decimal metadata is unusable"
+    );
+
+    // No escrow record was persisted: the public accessor must fail.
+    assert!(
+        client.try_get_escrow().is_err(),
+        "escrow must not be persisted after a failed init"
+    );
+
+    // No events were emitted by the escrow contract during the failed init.
+    let events = env.events().all();
+    assert!(
+        events.is_empty(),
+        "no events must be emitted when init fails on decimal metadata"
+    );
+}
+
+#[test]
+fn init_fails_when_token_decimals_metadata_mismatches_config() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token_id = env.register(MismatchedDecimalsToken, ());
+    let client = deploy(&env);
+
+    // Configured 6, token reports 7 → mismatch.
+    let result = client.try_init(
+        &Address::generate(&env),
+        &soroban_sdk::String::from_str(&env, "INV-DEC-WRONG"),
+        &Address::generate(&env),
+        &10_000_000,
+        &800i64,
+        &0u64,
+        &token_id,
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None::<i64>,
+        &Some(6u32),
+    );
+
+    assert_init_failed_without_persisting(&env, &client, result);
+}
+
+#[test]
+fn init_fails_when_token_decimals_returns_wrong_type() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token_id = env.register(WrongTypeDecimalsToken, ());
+    let client = deploy(&env);
+
+    let result = client.try_init(
+        &Address::generate(&env),
+        &soroban_sdk::String::from_str(&env, "INV-DEC-TYPE"),
+        &Address::generate(&env),
+        &10_000_000,
+        &800i64,
+        &0u64,
+        &token_id,
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None::<i64>,
+        &Some(7u32),
+    );
+
+    assert_init_failed_without_persisting(&env, &client, result);
+}
+
+#[test]
+fn init_fails_when_token_decimals_traps_with_contract_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token_id = env.register(ErroringDecimalsToken, ());
+    let client = deploy(&env);
+
+    let result = client.try_init(
+        &Address::generate(&env),
+        &soroban_sdk::String::from_str(&env, "INV-DEC-ERR"),
+        &Address::generate(&env),
+        &10_000_000,
+        &800i64,
+        &0u64,
+        &token_id,
+        &None,
+        &Address::generate(&env),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None::<i64>,
+        &Some(7u32),
+    );
+
+    assert_init_failed_without_persisting(&env, &client, result);
 }
 
 #[test]

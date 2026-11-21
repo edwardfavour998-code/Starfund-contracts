@@ -9,6 +9,9 @@ Related docs:
 - `docs/escrow-events.md` provides the shorter consumer-facing overview.
 - `docs/escrow-indexer.md` describes subscription, cursoring, and
   reconciliation.
+- `docs/escrow-indexer-release-checklist.md` is the release-time
+  compatibility review checklist for event topic, payload, and numeric error
+  changes.
 - `docs/openapi.yaml` does not expose raw Soroban events; decoded events should
   feed the API projections for escrow status, funding, settlement, claims,
   holds, attestations, allowlist state, and refunds.

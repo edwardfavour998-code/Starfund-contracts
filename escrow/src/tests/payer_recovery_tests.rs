@@ -51,6 +51,40 @@ fn test_propose_payer_recovery_non_admin_fails() {
     let (client, admin, sme) = setup(&env);
 
     let (token, treasury) = free_addresses(&env);
+    // Restrict authorization to the admin only so init succeeds but any
+    // subsequent non-admin authorization is rejected.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "init",
+            args: soroban_sdk::IntoVal::into_val(
+                &(
+                    admin.clone(),
+                    String::from_str(&env, "PAYER_REC_002"),
+                    sme.clone(),
+                    100_000_000_000i128,
+                    500i64,
+                    0u64,
+                    token.clone(),
+                    Option::<Address>::None,
+                    treasury.clone(),
+                    Option::<Address>::None,
+                    Option::<Address>::None,
+                    Option::<Address>::None,
+                    Option::<Address>::None,
+                    Option::<Address>::None,
+                    Option::<Address>::None,
+                    Option::<Address>::None,
+                    Option::<Address>::None,
+                    Option::<Address>::None,
+                    Option::<Address>::None,
+                ),
+                &env,
+            ),
+            sub_invokes: &[],
+        },
+    }]);
     client.init(
         &admin,
         &String::from_str(&env, "PAYER_REC_002"),
@@ -72,10 +106,31 @@ fn test_propose_payer_recovery_non_admin_fails() {
         &None,
         &None);
 
+    let escrow_before = client.get_escrow();
+    assert_eq!(escrow_before.payer, admin);
+    assert_eq!(escrow_before.pending_payer, None);
+
+    // Clear all authorizations: the non-admin propose must fail on auth.
+    env.mock_auths(&[]);
     let new_payer = Address::generate(&env);
-    // Don't mock auth for non-admin
     let res = client.try_propose_payer_recovery(&new_payer, &None);
-    assert!(res.is_err());
+    match res {
+        Err(Ok(err)) => assert_eq!(
+            err,
+            soroban_sdk::InvokeError::from(soroban_sdk::xdr::ScError::Context(
+                soroban_sdk::xdr::ScErrorType::Auth,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            )),
+            "expected authorization failure, got {:?}",
+            err
+        ),
+        other => panic!("expected authorization failure, got {:?}", other),
+    }
+
+    // State must be unchanged after the rejected call.
+    let escrow_after = client.get_escrow();
+    assert_eq!(escrow_after.payer, admin);
+    assert_eq!(escrow_after.pending_payer, None);
 }
 
 #[test]
@@ -111,6 +166,92 @@ fn test_propose_payer_recovery_same_payer_fails() {
         client.try_propose_payer_recovery(&admin, &None),
         EscrowError::NewPayerSameAsCurrent,
     );
+}
+
+#[test]
+fn test_propose_payer_recovery_self_address_fails_before_writes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+
+    let (token, treasury) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "PAYER_REC_014"),
+        &sme,
+        &100_000_000_000i128,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    // Propose the current payer as the new payer: must be rejected.
+    assert_contract_error(
+        client.try_propose_payer_recovery(&admin, &None),
+        EscrowError::NewPayerSameAsCurrent,
+    );
+
+    // No writes: payer unchanged and no pending proposal recorded.
+    let escrow = client.get_escrow();
+    assert_eq!(escrow.payer, admin);
+    assert_contract_error(
+        client.try_accept_payer_recovery(),
+        EscrowError::NoPendingPayer,
+    );
+}
+
+#[test]
+fn test_propose_payer_recovery_valid_new_payer_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+
+    let (token, treasury) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "PAYER_REC_015"),
+        &sme,
+        &100_000_000_000i128,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    // A distinct valid address is accepted as a recovery nomination.
+    let new_payer = Address::generate(&env);
+    assert_ne!(new_payer, admin);
+    let result = client.propose_payer_recovery(&new_payer, &None);
+    assert_eq!(result, new_payer);
+
+    // Payer is still unchanged until acceptance.
+    let escrow = client.get_escrow();
+    assert_eq!(escrow.payer, admin);
+
+    // The proposal can be accepted and updates the payer.
+    let updated_escrow = client.accept_payer_recovery();
+    assert_eq!(updated_escrow.payer, new_payer);
 }
 
 #[test]
@@ -469,6 +610,197 @@ fn test_payer_recovery_emits_correct_events() {
     .to_xdr(&env, &contract_id);
     let after_events = all_events_after.events();
     assert!(after_events.contains(&accept_event), "PayerRecoveryAccepted event not found");
+}
+
+#[test]
+fn test_payer_recovery_view_absent_returns_none() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+
+    let (token, treasury) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "PAYER_REC_014"),
+        &sme,
+        &100_000_000_000i128,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    assert!(client.get_pending_payer_recovery().is_none());
+}
+
+#[test]
+fn test_payer_recovery_view_matches_storage_after_propose() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+
+    let (token, treasury) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "PAYER_REC_015"),
+        &sme,
+        &100_000_000_000i128,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    let new_payer = Address::generate(&env);
+    client.propose_payer_recovery(&new_payer, &Some(3600));
+
+    let view = client
+        .get_pending_payer_recovery()
+        .expect("pending payer recovery view should be present");
+    assert_eq!(view.pending_payer, new_payer);
+    assert_eq!(view.proposed_at, env.ledger().timestamp());
+    assert_eq!(view.expires_at, env.ledger().timestamp() + 3600);
+}
+
+#[test]
+fn test_payer_recovery_view_updates_on_replacement() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+
+    let (token, treasury) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "PAYER_REC_016"),
+        &sme,
+        &100_000_000_000i128,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    let first_payer = Address::generate(&env);
+    client.propose_payer_recovery(&first_payer, &Some(100));
+    let first_view = client.get_pending_payer_recovery().unwrap();
+    assert_eq!(first_view.pending_payer, first_payer);
+
+    // Advance time so the replacement has a distinct proposal timestamp.
+    let mut ledger_info = env.ledger().get();
+    ledger_info.timestamp += 10;
+    env.ledger().set(ledger_info);
+
+    let second_payer = Address::generate(&env);
+    client.propose_payer_recovery(&second_payer, &Some(200));
+
+    let second_view = client.get_pending_payer_recovery().unwrap();
+    assert_eq!(second_view.pending_payer, second_payer);
+    assert_eq!(second_view.proposed_at, env.ledger().timestamp());
+    assert_eq!(second_view.expires_at, env.ledger().timestamp() + 200);
+}
+
+#[test]
+fn test_payer_recovery_view_cleared_on_accept() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+
+    let (token, treasury) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "PAYER_REC_017"),
+        &sme,
+        &100_000_000_000i128,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    let new_payer = Address::generate(&env);
+    client.propose_payer_recovery(&new_payer, &None);
+    assert!(client.get_pending_payer_recovery().is_some());
+
+    let updated = client.accept_payer_recovery();
+    assert_eq!(updated.payer, new_payer);
+    assert!(client.get_pending_payer_recovery().is_none());
+}
+
+#[test]
+fn test_payer_recovery_view_cleared_on_cancel() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+
+    let (token, treasury) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "PAYER_REC_018"),
+        &sme,
+        &100_000_000_000i128,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    let new_payer = Address::generate(&env);
+    client.propose_payer_recovery(&new_payer, &None);
+    assert!(client.get_pending_payer_recovery().is_some());
+
+    client.cancel_pending_payer();
+    assert!(client.get_pending_payer_recovery().is_none());
+    assert_eq!(client.get_escrow().payer, admin);
 }
 
 #[test]

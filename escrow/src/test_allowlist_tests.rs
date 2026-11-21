@@ -397,6 +397,295 @@ fn test_multiple_investors_independent_allowlist_entries() {
     assert!(blocked.is_err());
 }
 
+// =============================================================================
+// Issue #383 — single vs batch membership mutation parity
+//
+// `set_investor_allowlisted` and `set_investors_allowlisted` must share one
+// edge-transition implementation.  These tests run the equivalent single and
+// batch operations over add / remove / no-op cases and assert:
+//   • identical resulting membership + index state
+//   • identical `InvestorAllowlistChanged` event payloads and ordering
+//   • the nonce is consumed exactly once per entrypoint call
+// =============================================================================
+
+/// Read the raw `InvestorAllowlisted` entry (None when never written).
+fn allowlist_entry(
+    env: &Env,
+    contract_id: &Address,
+    investor: &Address,
+) -> Option<bool> {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::InvestorAllowlisted(investor.clone()))
+    })
+}
+
+/// Read the raw `AllowlistIndex` vector.
+fn allowlist_index(env: &Env, contract_id: &Address) -> SorobanVec<Address> {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, SorobanVec<Address>>(&DataKey::AllowlistIndex)
+            .unwrap_or_else(|| SorobanVec::new(env))
+    })
+}
+
+/// Read the stored nonce.
+fn stored_nonce(env: &Env, contract_id: &Address) -> u64 {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::Nonce)
+            .unwrap_or(0)
+    })
+}
+
+/// Extract only the `InvestorAllowlistChanged` events from the last call.
+fn allowlist_changed_events(
+    env: &Env,
+    contract_id: &Address,
+) -> std::vec::Vec<InvestorAllowlistChanged> {
+    let mut out = std::vec::Vec::new();
+    for (_, topics, data) in env.events().all().iter() {
+        let _ = topics;
+        if let Ok(decoded) = InvestorAllowlistChanged::try_from_val(env, &data) {
+            out.push(decoded);
+        }
+    }
+    let _ = contract_id;
+    out
+}
+
+/// Deploy + init two independent escrows so single and batch paths can be
+/// compared side by side under identical starting conditions.
+fn deploy_pair(env: &Env) -> (StarfundEscrowClient<'_>, StarfundEscrowClient<'_>) {
+    let single = deploy(env);
+    init(env, &single);
+    let batch = deploy(env);
+    init(env, &batch);
+    (single, batch)
+}
+
+#[test]
+fn parity_add_single_matches_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (single, batch) = deploy_pair(&env);
+
+    let investor = Address::generate(&env);
+
+    let nonce_before = stored_nonce(&env, &single.address);
+
+    single.set_investor_allowlisted(&investor, &true, &0u32);
+    let single_events = allowlist_changed_events(&env, &single.address);
+    let single_nonce = stored_nonce(&env, &single.address);
+
+    let mut v: SorobanVec<Address> = SorobanVec::new(&env);
+    v.push_back(investor.clone());
+    batch.set_investors_allowlisted(&v, &true, &0u32);
+    let batch_events = allowlist_changed_events(&env, &batch.address);
+    let batch_nonce = stored_nonce(&env, &batch.address);
+
+    // Membership + index state identical.
+    assert_eq!(
+        allowlist_entry(&env, &single.address, &investor),
+        Some(true)
+    );
+    assert_eq!(
+        allowlist_entry(&env, &batch.address, &investor),
+        Some(true)
+    );
+    assert_eq!(
+        allowlist_index(&env, &single.address),
+        allowlist_index(&env, &batch.address)
+    );
+
+    // Per-investor event payloads identical and in the same order.
+    assert_eq!(single_events, batch_events);
+    assert_eq!(single_events.len(), 1);
+    assert_eq!(single_events[0].investor, investor);
+    assert_eq!(single_events[0].allowed, 1);
+
+    // Nonce consumed exactly once per call.
+    assert_eq!(single_nonce, nonce_before + 1);
+    assert_eq!(batch_nonce, nonce_before + 1);
+}
+
+#[test]
+fn parity_remove_single_matches_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (single, batch) = deploy_pair(&env);
+
+    let investor = Address::generate(&env);
+
+    // Seed both with an allowlisted entry.
+    single.set_investor_allowlisted(&investor, &true, &0u32);
+    let mut seed: SorobanVec<Address> = SorobanVec::new(&env);
+    seed.push_back(investor.clone());
+    batch.set_investors_allowlisted(&seed, &true, &0u32);
+
+    let nonce_before = stored_nonce(&env, &single.address);
+
+    single.set_investor_allowlisted(&investor, &false, &0u32);
+    let single_events = allowlist_changed_events(&env, &single.address);
+    let single_nonce = stored_nonce(&env, &single.address);
+
+    batch.set_investors_allowlisted(&seed, &false, &0u32);
+    let batch_events = allowlist_changed_events(&env, &batch.address);
+    let batch_nonce = stored_nonce(&env, &batch.address);
+
+    assert_eq!(
+        allowlist_entry(&env, &single.address, &investor),
+        Some(false)
+    );
+    assert_eq!(
+        allowlist_entry(&env, &batch.address, &investor),
+        Some(false)
+    );
+    assert_eq!(
+        allowlist_index(&env, &single.address),
+        allowlist_index(&env, &batch.address)
+    );
+
+    assert_eq!(single_events, batch_events);
+    assert_eq!(single_events.len(), 1);
+    assert_eq!(single_events[0].allowed, 0);
+
+    assert_eq!(single_nonce, nonce_before + 1);
+    assert_eq!(batch_nonce, nonce_before + 1);
+}
+
+#[test]
+fn parity_noop_single_matches_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (single, batch) = deploy_pair(&env);
+
+    let investor = Address::generate(&env);
+
+    // No-op: removing an address that was never allowlisted.
+    let nonce_before = stored_nonce(&env, &single.address);
+
+    single.set_investor_allowlisted(&investor, &false, &0u32);
+    let single_events = allowlist_changed_events(&env, &single.address);
+    let single_nonce = stored_nonce(&env, &single.address);
+
+    let mut v: SorobanVec<Address> = SorobanVec::new(&env);
+    v.push_back(investor.clone());
+    batch.set_investors_allowlisted(&v, &false, &0u32);
+    let batch_events = allowlist_changed_events(&env, &batch.address);
+    let batch_nonce = stored_nonce(&env, &batch.address);
+
+    // Neither path writes an entry nor touches the index.
+    assert_eq!(allowlist_entry(&env, &single.address, &investor), None);
+    assert_eq!(allowlist_entry(&env, &batch.address, &investor), None);
+    assert_eq!(allowlist_index(&env, &single.address).len(), 0);
+    assert_eq!(allowlist_index(&env, &batch.address).len(), 0);
+
+    // Same (empty) per-investor event sequence.
+    assert_eq!(single_events, batch_events);
+
+    // Nonce still consumed exactly once per call, even for a no-op.
+    assert_eq!(single_nonce, nonce_before + 1);
+    assert_eq!(batch_nonce, nonce_before + 1);
+}
+
+#[test]
+fn parity_batch_events_match_sequential_single_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (single, batch) = deploy_pair(&env);
+
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let c = Address::generate(&env);
+
+    // Sequential single calls (one nonce per call).
+    let nonce_before = stored_nonce(&env, &single.address);
+    single.set_investor_allowlisted(&a, &true, &0u32);
+    single.set_investor_allowlisted(&b, &true, &0u32);
+    single.set_investor_allowlisted(&c, &true, &0u32);
+    let single_events = allowlist_changed_events(&env, &single.address);
+    let single_nonce = stored_nonce(&env, &single.address);
+
+    // One batch call (one nonce for the whole batch).
+    let mut v: SorobanVec<Address> = SorobanVec::new(&env);
+    v.push_back(a.clone());
+    v.push_back(b.clone());
+    v.push_back(c.clone());
+    batch.set_investors_allowlisted(&v, &true, &0u32);
+    let batch_events = allowlist_changed_events(&env, &batch.address);
+    let batch_nonce = stored_nonce(&env, &batch.address);
+
+    // Same per-investor events, same order.
+    assert_eq!(single_events, batch_events);
+    assert_eq!(batch_events.len(), 3);
+    assert_eq!(batch_events[0].investor, a);
+    assert_eq!(batch_events[1].investor, b);
+    assert_eq!(batch_events[2].investor, c);
+
+    // Identical index state.
+    assert_eq!(
+        allowlist_index(&env, &single.address),
+        allowlist_index(&env, &batch.address)
+    );
+
+    // Single path consumes 3 nonces; batch consumes exactly 1.
+    assert_eq!(single_nonce, nonce_before + 3);
+    assert_eq!(batch_nonce, nonce_before + 1);
+}
+
+#[test]
+fn parity_batch_mixed_add_remove_matches_single() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (single, batch) = deploy_pair(&env);
+
+    let keep = Address::generate(&env);
+    let drop = Address::generate(&env);
+
+    // Seed both escrows identically.
+    single.set_investor_allowlisted(&keep, &true, &0u32);
+    single.set_investor_allowlisted(&drop, &true, &0u32);
+    let mut seed: SorobanVec<Address> = SorobanVec::new(&env);
+    seed.push_back(keep.clone());
+    seed.push_back(drop.clone());
+    batch.set_investors_allowlisted(&seed, &true, &0u32);
+
+    // Single: re-add (no-op) then remove.
+    single.set_investor_allowlisted(&keep, &true, &0u32);
+    single.set_investor_allowlisted(&drop, &false, &0u32);
+    let single_events = allowlist_changed_events(&env, &single.address);
+
+    // Batch: same operations in one call.
+    let mut ops: SorobanVec<Address> = SorobanVec::new(&env);
+    ops.push_back(keep.clone());
+    batch.set_investors_allowlisted(&ops, &true, &0u32);
+    let mut revoke: SorobanVec<Address> = SorobanVec::new(&env);
+    revoke.push_back(drop.clone());
+    batch.set_investors_allowlisted(&revoke, &false, &0u32);
+    let batch_events = allowlist_changed_events(&env, &batch.address);
+
+    // Final membership + index identical.
+    assert_eq!(
+        allowlist_entry(&env, &single.address, &keep),
+        allowlist_entry(&env, &batch.address, &keep)
+    );
+    assert_eq!(
+        allowlist_entry(&env, &single.address, &drop),
+        allowlist_entry(&env, &batch.address, &drop)
+    );
+    assert_eq!(
+        allowlist_index(&env, &single.address),
+        allowlist_index(&env, &batch.address)
+    );
+
+    // Per-investor event payloads identical.
+    assert_eq!(single_events, batch_events);
+}
+
 #[test]
 fn test_batch_add_and_remove_from_allowlist() {
     let env = Env::default();

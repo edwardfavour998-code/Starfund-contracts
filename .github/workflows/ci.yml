@@ -42,16 +42,35 @@ jobs:
       - name: Build WASM
         run: cargo build --target wasm32v1-none --release -p starfund_escrow
 
+      - name: Verify release WASM size budget
+        run: |
+          WASM_FILE="target/wasm32v1-none/release/starfund_escrow.wasm"
+          MAX_BYTES=65536
+          ACTUAL_BYTES=$(stat -c%s "$WASM_FILE" 2>/dev/null || wc -c < "$WASM_FILE")
+          echo "Release WASM size: $ACTUAL_BYTES bytes (hard budget: $MAX_BYTES bytes)"
+          if [ "$ACTUAL_BYTES" -gt "$MAX_BYTES" ]; then
+            echo "Error: WASM size exceeds budget of $MAX_BYTES bytes"
+            exit 1
+          fi
+
+      - name: Rustdoc warning gate
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps -p starfund_escrow
+
       - name: Workspace Clippy (all targets)
         run: cargo clippy -p starfund_escrow --all-targets -- -D warnings
 
-      - name: Check coverage (report)
+      - name: Check coverage and publish machine-readable diagnostics
         run: |
           cargo llvm-cov \
             --features testutils \
             --summary-only \
+            --lcov \
+            --output-path coverage.lcov \
             --fail-under-lines 90 \
             -p starfund_escrow
+
 
   cargo-audit:
     runs-on: ubuntu-latest

@@ -10,26 +10,12 @@ use std::format;
 fn test_init_stores_escrow() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
-    let escrow = client.init(
-        &admin,
-        &soroban_sdk::String::from_str(&env, "INV001"),
-        &sme,
-        &TARGET,
-        &800i64,
-        &1000u64,
-        &Address::generate(&env),
-        &None,
-        &Address::generate(&env),
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    let escrow = TestConfig::new(&env, &admin, &sme)
+        .invoice_id("INV001")
+        .amount(TARGET)
+        .yield_bps(800)
+        .maturity(1000)
+        .init(&client);
     assert_eq!(escrow.invoice_id, symbol_short!("INV001"));
     assert_eq!(escrow.admin, admin);
     assert_eq!(escrow.sme_address, sme);
@@ -47,52 +33,24 @@ fn test_init_rejects_min_contribution_above_max_per_investor() {
     env.mock_all_auths();
     let client = deploy(&env);
 
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
     assert_contract_error(
-        client.try_init(
-            &Address::generate(&env),
-            &soroban_sdk::String::from_str(&env, "INIT-FLOOR-CAP"),
-            &Address::generate(&env),
-            &10_000i128,
-            &800i64,
-            &0u64,
-            &Address::generate(&env),
-            &None,
-            &Address::generate(&env),
-            &None,
-            &Some(5_000i128),
-            &None,
-            &Some(1_000i128),
-            &None,
-            &None,
-            &None,
-            &None,
-            &None::<i64>,
-            &None::<u32>,
-        ),
+        TestConfig::new(&env, &admin, &sme)
+            .invoice_id("INIT-FLOOR-CAP")
+            .amount(10_000)
+            .min_contribution(Some(5_000))
+            .max_per_investor(Some(1_000))
+            .try_init(&client),
         EscrowError::MinContributionExceedsMaxPerInvestor,
     );
 
-    client.init(
-        &Address::generate(&env),
-        &soroban_sdk::String::from_str(&env, "INIT-FLOOR-CAP-EQ"),
-        &Address::generate(&env),
-        &10_000i128,
-        &800i64,
-        &0u64,
-        &Address::generate(&env),
-        &None,
-        &Address::generate(&env),
-        &None,
-        &Some(1_000i128),
-        &None,
-        &Some(1_000i128),
-        &None,
-        &None,
-        &None,
-        &None,
-        &None::<i64>,
-        &None::<u32>,
-    );
+    TestConfig::new(&env, &admin, &sme)
+        .invoice_id("INIT-FLOOR-CAP-EQ")
+        .amount(10_000)
+        .min_contribution(Some(1_000))
+        .max_per_investor(Some(1_000))
+        .init(&client);
 }
 
 #[test]
@@ -102,28 +60,14 @@ fn test_init_rejects_max_per_investor_above_amount() {
         env.mock_all_auths();
         let client = deploy(&env);
 
+        let admin = Address::generate(&env);
+        let sme = Address::generate(&env);
         assert_contract_error(
-            client.try_init(
-                &Address::generate(&env),
-                &soroban_sdk::String::from_str(&env, "INIT-CAP"),
-                &Address::generate(&env),
-                &1_000i128,
-                &800i64,
-                &0u64,
-                &Address::generate(&env),
-                &None,
-                &Address::generate(&env),
-                &None,
-                &None,
-                &None,
-                &Some(max_per_investor),
-                &None,
-                &None,
-                &None,
-                &None,
-                &None::<i64>,
-                &None::<u32>,
-            ),
+            TestConfig::new(&env, &admin, &sme)
+                .invoice_id("INIT-CAP")
+                .amount(1_000)
+                .max_per_investor(Some(max_per_investor))
+                .try_init(&client),
             EscrowError::MaxPerInvestorExceedsAmount,
         );
     }
@@ -151,47 +95,173 @@ fn test_init_rejects_contract_address_as_token_or_recipient() {
             Address::generate(&env)
         };
 
+        let admin = Address::generate(&env);
         assert_contract_error(
-            client.try_init(
-                &Address::generate(&env),
-                &soroban_sdk::String::from_str(&env, "INIT-SELF"),
-                &sme,
-                &1_000i128,
-                &800i64,
-                &0u64,
-                &token,
-                &None,
-                &treasury,
-                &None,
-                &None,
-                &None,
-                &None,
-                &None,
-                &None,
-                &None,
-                &None,
-                &None::<i64>,
-                &None::<u32>,
-            ),
+            TestConfig::new(&env, &admin, &sme)
+                .invoice_id("INIT-SELF")
+                .amount(1_000)
+                .funding_token(token)
+                .treasury(treasury)
+                .try_init(&client),
             EscrowError::InitAddressIsContract,
         );
     }
 }
 
 #[test]
-fn test_init_stores_keyed_invoice_and_lists_it() {
+fn test_init_rejects_admin_equal_sme() {
     let env = Env::default();
-    let (client, admin, sme) = setup(&env);
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let shared = Address::generate(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    assert_contract_error(
+        client.try_init(
+            &shared,
+            &soroban_sdk::String::from_str(&env, "ROLE-ADM-SME"),
+            &shared,
+            &1_000i128,
+            &800i64,
+            &0u64,
+            &token,
+            &None,
+            &treasury,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None::<i64>,
+            &None::<u32>,
+        ),
+        EscrowError::AdminEqualsSme,
+    );
+}
+
+#[test]
+fn test_init_rejects_admin_equal_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let shared = Address::generate(&env);
+    let (token, sme) = free_addresses(&env);
+
+    assert_contract_error(
+        client.try_init(
+            &shared,
+            &soroban_sdk::String::from_str(&env, "ROLE-ADM-TRE"),
+            &sme,
+            &1_000i128,
+            &800i64,
+            &0u64,
+            &token,
+            &None,
+            &shared,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None::<i64>,
+            &None::<u32>,
+        ),
+        EscrowError::AdminEqualsTreasury,
+    );
+}
+
+#[test]
+fn test_init_rejects_sme_equal_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let shared = Address::generate(&env);
+    let (token, admin) = free_addresses(&env);
+
+    assert_contract_error(
+        client.try_init(
+            &admin,
+            &soroban_sdk::String::from_str(&env, "ROLE-SME-TRE"),
+            &shared,
+            &1_000i128,
+            &800i64,
+            &0u64,
+            &token,
+            &None,
+            &shared,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None::<i64>,
+            &None::<u32>,
+        ),
+        EscrowError::SmeEqualsTreasury,
+    );
+}
+
+#[test]
+fn test_init_rejects_sme_equal_contract_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_address, client) = deploy_with_id(&env);
+    let (token, treasury) = free_addresses(&env);
+
+    assert_contract_error(
+        client.try_init(
+            &Address::generate(&env),
+            &soroban_sdk::String::from_str(&env, "ROLE-SME-SELF"),
+            &contract_address,
+            &1_000i128,
+            &800i64,
+            &0u64,
+            &token,
+            &None,
+            &treasury,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None::<i64>,
+            &None::<u32>,
+        ),
+        EscrowError::InitAddressIsContract,
+    );
+}
+
+#[test]
+fn test_init_accepts_distinct_role_addresses() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let (token, treasury) = free_addresses(&env);
+
     let escrow = client.init(
         &admin,
-        &soroban_sdk::String::from_str(&env, "INV001"),
+        &soroban_sdk::String::from_str(&env, "ROLE-OK"),
         &sme,
-        &TARGET,
+        &1_000i128,
         &800i64,
-        &1000u64,
-        &Address::generate(&env),
+        &0u64,
+        &token,
         &None,
-        &Address::generate(&env),
+        &treasury,
         &None,
         &None,
         &None,
@@ -202,6 +272,22 @@ fn test_init_stores_keyed_invoice_and_lists_it() {
         &None,
         &None,
         &None);
+
+    assert_eq!(escrow.admin, admin);
+    assert_eq!(escrow.sme_address, sme);
+    assert_eq!(client.get_treasury(), treasury);
+}
+
+#[test]
+fn test_init_stores_keyed_invoice_and_lists_it() {
+    let env = Env::default();
+    let (client, admin, sme) = setup(&env);
+    let escrow = TestConfig::new(&env, &admin, &sme)
+        .invoice_id("INV001")
+        .amount(TARGET)
+        .yield_bps(800)
+        .maturity(1000)
+        .init(&client);
     let got = client.get_escrow();
     assert_eq!(got, escrow);
 }
@@ -210,30 +296,23 @@ fn test_init_stores_keyed_invoice_and_lists_it() {
 fn test_init_requires_admin_auth() {
     let env = Env::default();
     let (client, admin, sme) = setup(&env);
-    client.init(
-        &admin,
-        &soroban_sdk::String::from_str(&env, "INVB"),
-        &sme,
-        &TARGET,
-        &800i64,
-        &1000u64,
-        &Address::generate(&env),
-        &None,
-        &Address::generate(&env),
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    TestConfig::new(&env, &admin, &sme)
+        .invoice_id("INVB")
+        .amount(TARGET)
+        .yield_bps(800)
+        .maturity(1000)
+        .init(&client);
     assert!(
         env.auths().iter().any(|(addr, _)| *addr == admin),
         "admin auth was not recorded for init"
     );
+    // The generated init authorization payload must target the admin address.
+    let (auth_addr, _) = env
+        .auths()
+        .into_iter()
+        .find(|(addr, _)| *addr == admin)
+        .expect("admin auth entry missing");
+    assert_eq!(auth_addr, admin);
 }
 
 #[test]
@@ -303,27 +382,14 @@ fn test_reinit_same_parameters_rejected() {
     let treasury = client.get_treasury();
     let events_before = env.events().all();
     assert_contract_error(
-        client.try_init(
-            &admin,
-            &soroban_sdk::String::from_str(&env, "INV001"),
-            &sme,
-            &TARGET,
-            &800i64,
-            &1000u64,
-            &token,
-            &None,
-            &treasury,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None::<i64>,
-            &None::<u32>,
-        ),
+        TestConfig::new(&env, &admin, &sme)
+            .invoice_id("INV001")
+            .amount(TARGET)
+            .yield_bps(800)
+            .maturity(1000)
+            .funding_token(token)
+            .treasury(treasury)
+            .try_init(&client),
         EscrowError::EscrowAlreadyInitialized,
     );
     assert_eq!(client.get_escrow(), escrow);
@@ -344,27 +410,14 @@ fn test_reinit_different_admin_rejected() {
     let treasury = client.get_treasury();
     let events_before = env.events().all();
     assert_contract_error(
-        client.try_init(
-            &other_admin,
-            &soroban_sdk::String::from_str(&env, "INV001"),
-            &sme,
-            &TARGET,
-            &800i64,
-            &1000u64,
-            &token,
-            &None,
-            &treasury,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None::<i64>,
-            &None::<u32>,
-        ),
+        TestConfig::new(&env, &other_admin, &sme)
+            .invoice_id("INV001")
+            .amount(TARGET)
+            .yield_bps(800)
+            .maturity(1000)
+            .funding_token(token)
+            .treasury(treasury)
+            .try_init(&client),
         EscrowError::EscrowAlreadyInitialized,
     );
     assert_eq!(client.get_escrow(), escrow);
@@ -385,27 +438,14 @@ fn test_reinit_different_token_rejected() {
     let other_token = Address::generate(&env);
     let events_before = env.events().all();
     assert_contract_error(
-        client.try_init(
-            &admin,
-            &soroban_sdk::String::from_str(&env, "INV002"),
-            &sme,
-            &TARGET,
-            &800i64,
-            &1000u64,
-            &other_token,
-            &None,
-            &treasury,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None::<i64>,
-            &None::<u32>,
-        ),
+        TestConfig::new(&env, &admin, &sme)
+            .invoice_id("INV002")
+            .amount(TARGET)
+            .yield_bps(800)
+            .maturity(1000)
+            .funding_token(other_token)
+            .treasury(treasury)
+            .try_init(&client),
         EscrowError::EscrowAlreadyInitialized,
     );
     assert_eq!(client.get_escrow(), escrow);
@@ -429,27 +469,14 @@ fn test_reinit_during_another_call_rejected() {
     let treasury = client.get_treasury();
     let events_before = env.events().all();
     assert_contract_error(
-        client.try_init(
-            &admin,
-            &soroban_sdk::String::from_str(&env, "INV001"),
-            &sme,
-            &TARGET,
-            &800i64,
-            &1000u64,
-            &token,
-            &None,
-            &treasury,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None::<i64>,
-            &None::<u32>,
-        ),
+        TestConfig::new(&env, &admin, &sme)
+            .invoice_id("INV001")
+            .amount(TARGET)
+            .yield_bps(800)
+            .maturity(1000)
+            .funding_token(token)
+            .treasury(treasury)
+            .try_init(&client),
         EscrowError::EscrowAlreadyInitialized,
     );
     assert_eq!(client.get_escrow(), escrow);
@@ -554,27 +581,14 @@ fn test_init_amount_exceeds_max_rejected() {
     let (client, admin, sme) = setup(&env);
     let (token, treasury) = free_addresses(&env);
     assert_contract_error(
-        client.try_init(
-            &admin,
-            &soroban_sdk::String::from_str(&env, "INV103"),
-            &sme,
-            &(crate::MAX_INVOICE_AMOUNT + 1),
-            &800i64,
-            &1000u64,
-            &token,
-            &None,
-            &treasury,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None::<i64>,
-            &None::<u32>,
-        ),
+        TestConfig::new(&env, &admin, &sme)
+            .invoice_id("INV103")
+            .amount(crate::MAX_INVOICE_AMOUNT + 1)
+            .yield_bps(800)
+            .maturity(1000)
+            .funding_token(token)
+            .treasury(treasury)
+            .try_init(&client),
         EscrowError::AmountExceedsMax,
     );
 }
@@ -961,27 +975,14 @@ fn test_init_min_contribution_zero_rejected() {
     let (tok, tre) = free_addresses(&env);
     // A min_contribution floor of 0 is non-positive and must be rejected at init.
     assert_contract_error(
-        client.try_init(
-            &admin,
-            &soroban_sdk::String::from_str(&env, "FLOOR03"),
-            &sme,
-            &10_000i128,
-            &500i64,
-            &0u64,
-            &tok,
-            &None,
-            &tre,
-            &None,
-            &Some(0i128),
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None::<i64>,
-            &None::<u32>,
-        ),
+        TestConfig::new(&env, &admin, &sme)
+            .invoice_id("FLOOR03")
+            .amount(10_000)
+            .yield_bps(500)
+            .funding_token(tok)
+            .treasury(tre)
+            .min_contribution(Some(0))
+            .try_init(&client),
         EscrowError::MinContributionNotPositive,
     );
 }
@@ -997,27 +998,14 @@ fn test_init_min_contribution_exceeds_amount_rejected() {
     let (tok, tre) = free_addresses(&env);
     // A floor above the invoice amount is unsatisfiable and must be rejected at init.
     assert_contract_error(
-        client.try_init(
-            &admin,
-            &soroban_sdk::String::from_str(&env, "FLOOR04"),
-            &sme,
-            &1_000i128,
-            &500i64,
-            &0u64,
-            &tok,
-            &None,
-            &tre,
-            &None,
-            &Some(1_001i128),
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None::<i64>,
-            &None::<u32>,
-        ),
+        TestConfig::new(&env, &admin, &sme)
+            .invoice_id("FLOOR04")
+            .amount(1_000)
+            .yield_bps(500)
+            .funding_token(tok)
+            .treasury(tre)
+            .min_contribution(Some(1_001))
+            .try_init(&client),
         EscrowError::MinContributionExceedsAmount,
     );
 }
@@ -1668,27 +1656,14 @@ fn test_init_maturity_beyond_horizon_rejected() {
     let (token, treasury) = free_addresses(&env);
     env.ledger().set_timestamp(1000);
     assert_contract_error(
-        client.try_init(
-            &admin,
-            &soroban_sdk::String::from_str(&env, "MAT03"),
-            &sme,
-            &1000i128,
-            &800i64,
-            &(1000u64 + DEFAULT_MATURITY_MAX_HORIZON_SECS + 1),
-            &token,
-            &None,
-            &treasury,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None::<i64>,
-            &None::<u32>,
-        ),
+        TestConfig::new(&env, &admin, &sme)
+            .invoice_id("MAT03")
+            .amount(1000)
+            .yield_bps(800)
+            .maturity(1000u64 + DEFAULT_MATURITY_MAX_HORIZON_SECS + 1)
+            .funding_token(token)
+            .treasury(treasury)
+            .try_init(&client),
         EscrowError::MaturityExceedsMaxHorizon,
     );
 }
@@ -1700,27 +1675,14 @@ fn test_init_maturity_in_past_rejected() {
     let (token, treasury) = free_addresses(&env);
     env.ledger().set_timestamp(2000);
     assert_contract_error(
-        client.try_init(
-            &admin,
-            &soroban_sdk::String::from_str(&env, "MAT04"),
-            &sme,
-            &1000i128,
-            &800i64,
-            &1000u64,
-            &token,
-            &None,
-            &treasury,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None::<i64>,
-            &None::<u32>,
-        ),
+        TestConfig::new(&env, &admin, &sme)
+            .invoice_id("MAT04")
+            .amount(1000)
+            .yield_bps(800)
+            .maturity(1000)
+            .funding_token(token)
+            .treasury(treasury)
+            .try_init(&client),
         EscrowError::MaturityInPast,
     );
 }

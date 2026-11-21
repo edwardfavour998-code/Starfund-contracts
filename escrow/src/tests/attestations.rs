@@ -13,6 +13,10 @@
 //! off-chain verifiers can confirm the on-chain anchor matches their document set.
 
 use super::*;
+use crate::attestation::{
+    load_attestation_log, require_attestation_index_in_range,
+    require_attestation_revocation_state,
+};
 use crate::MAX_ATTESTATION_REVOKE_BATCH;
 use soroban_sdk::{symbol_short, testutils::Events, BytesN, Error, InvokeError};
 use std::fmt::Debug;

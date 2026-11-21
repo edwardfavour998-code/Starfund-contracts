@@ -412,3 +412,37 @@ describe("ErrorResponse schema", () => {
     assertInvalid(ref, { error: "NOT_FOUND" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// OpenAPI Examples Conformance & Unknown-Field Policy (Issues #366, #367)
+// ---------------------------------------------------------------------------
+
+describe("OpenAPI examples conformance against declared schemas (Issue #366)", () => {
+  for (const [name, schema] of Object.entries(schemas)) {
+    if (schema.example !== undefined) {
+      it(`validates schema.example for #/components/schemas/${name}`, () => {
+        assertValid(`#/components/schemas/${name}`, schema.example);
+      });
+    }
+  }
+});
+
+describe("Unknown-field policy enforcement for API requests (Issue #367)", () => {
+  const invoiceCreateRef = "#/components/schemas/CreateInvoiceRequest";
+  if (schemas.CreateInvoiceRequest) {
+    it("rejects requests containing unrecognized extra fields when additionalProperties is false", () => {
+      const strictValidator = ajv.compile({
+        ...schemas.CreateInvoiceRequest,
+        additionalProperties: false,
+      });
+      const invalidPayload = {
+        amount: "10000000",
+        currency: "XLM",
+        recipient: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        unrecognized_malicious_field: true,
+      };
+      assert.strictEqual(strictValidator(invalidPayload), false);
+    });
+  }
+});
+

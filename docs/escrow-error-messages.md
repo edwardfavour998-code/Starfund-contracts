@@ -56,6 +56,8 @@ Codes raised by cross-contract callback entrypoints (`register_callback`, `execu
 | `CallbackReplayed` | 243 | Callback execution attempted on an already-consumed callback context (replay attempt). |
 | `CallbackAfterCancellation` | 244 | Callback registration or execution attempted on a cancelled escrow (`status == 4`). |
 | `CallbackNotFound` | 245 | Callback execution attempted with a nonce that has no registered context in storage. |
+| `CallbackOriginIsSelf` | 246 | `register_callback` used the escrow contract's own address (`env.current_contract_address()`) as the callback origin. Rejected before any nonce is allocated. Supported origins are external addresses (investor, SME, admin, treasury) and other deployed contracts. |
+| `CallbackCancelled` | 247 | Callback execution attempted on a callback whose pending registration was explicitly cancelled by the admin via `cancel_callback`. |
 
 Codes 36–41 (SEP-41 transfer-wrapper guards, also raised by `withdraw` and
 `claim_investor_payout`) are documented in

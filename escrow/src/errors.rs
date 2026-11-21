@@ -38,4 +38,6 @@ pub enum EscrowError {
     EscrowExpired = 32,
     EscrowNotExpired = 33,
     InvalidExpiry = 34,
+    CallbackOriginIsSelf = 35,
+    CallbackCancelled = 36,
 }

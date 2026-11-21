@@ -109,6 +109,68 @@ Callers can safely invoke the entrypoint because extending TTL cannot harm the c
 - the operation is monotonic (never decreases TTL)
 - only TTL extension occurs (no writes to escrow balances, gates, or payout markers)
 
+---
+
+## Restoration-first troubleshooting before TTL maintenance
+
+`bump_ttl` and `batch_bump_ttl` are **TTL maintenance only**. They extend the TTL of keys that are
+currently present in the live ledger and **skip keys that are absent**. They do not write, recreate,
+or reconstruct any entry. In particular, they cannot reconstruct archived investor data: extending
+the TTL of the keys that are still present does nothing for a per-investor key that has already been
+evicted, so an operator can call maintenance repeatedly while missing liabilities remain
+inaccessible.
+
+### Three storage states
+
+| State | Meaning | Visible to `bump_ttl` / `batch_bump_ttl`? |
+|---|---|---|
+| **Absent** | The key was never written, or was explicitly removed. No entry exists in the live ledger and none exists in history for this key. | No — skipped. Nothing to extend, nothing to restore. |
+| **Archived** | The entry was evicted from the live ledger after its TTL lapsed, but it still exists in ledger history and can be restored. | No — skipped while archived. The key is not in the live ledger, so there is no TTL to extend. |
+| **Restored** | The entry has been re-created in the live ledger from ledger history via a restoration operation. | Yes — once restored, `bump_ttl` / `batch_bump_ttl` can extend its TTL like any other present key. |
+
+Restoration is a separate operation from TTL extension. It must happen **before** maintenance, not
+as a substitute for it.
+
+### What maintenance does *not* do
+
+No maintenance call — `bump_ttl`, `batch_bump_ttl`, or any funding-deadline TTL top-up — recreates
+balances or liabilities. These entrypoints only call `extend_ttl(...)`; they never write
+`InvestorContribution`, `InvestorEffectiveYield`, `InvestorClaimNotBefore`, `InvestorClaimed`, or any
+other value. If a liability is missing, the fix is restoration from ledger history, not repeated
+maintenance calls.
+
+The has-checks in `escrow/src/lib.rs` follow the same rule: they test for the *presence* of a key
+(e.g. `has(DataKey::InvestorContribution(addr))`) and branch on it. A `false` result means the key is
+absent or archived — it does **not** mean the liability is zero, and no code path synthesizes a
+default balance in that case. Treat a failed has-check as evidence that restoration may be required.
+
+### Troubleshooting recipe
+
+1. **Gather ledger/RPC evidence.** Before touching TTLs, query the network for the contract's data
+   entries (for example via `getLedgerEntries` / contract-data queries against the RPC, or by
+   inspecting the ledger entry set for the contract instance). Compare the returned keys against the
+   set of investors you expect to be live. Any expected per-investor key that is missing from the
+   live entry set is either **absent** or **archived** — the RPC evidence tells you which, since
+   archived entries are still discoverable in ledger history.
+2. **Restore archived entries from history.** For each key identified as archived in step 1, perform
+   a restoration operation so the entry is re-created in the live ledger. Do not attempt to
+   reconstruct the value by hand or by re-running funding flows; restore the historical entry.
+3. **Only then run TTL maintenance.** Once the entries are restored (present in the live ledger),
+   call `bump_ttl` or `batch_bump_ttl` to extend their TTLs and prevent re-archival. Keys that were
+   genuinely absent in step 1 remain absent — maintenance will skip them, and that is expected.
+
+### Local-network validation
+
+1. Start a local network and deploy the escrow contract.
+2. Fund an investor so the per-investor persistent keys are written.
+3. Let the entry TTL lapse (or force archival) so the entry is evicted from the live ledger.
+4. Confirm the key is missing from live entries via the RPC query used in step 1 of the recipe, and
+   confirm a has-check in the contract reports it as not present.
+5. Call `bump_ttl` / `batch_bump_ttl` and verify the archived key is **not** recreated — maintenance
+   skips it.
+6. Restore the entry from history, then call `bump_ttl` / `batch_bump_ttl` again and verify the TTL
+   is extended on the now-present key.
+
 References:
 
 - ADR-007: storage key evolution policy and semantics

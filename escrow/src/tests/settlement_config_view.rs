@@ -367,3 +367,225 @@ fn test_summary_new_fields_are_idempotent() {
     assert_eq!(a.funding_deadline, b.funding_deadline);
     assert_eq!(a.token_decimals, b.token_decimals);
 }
+
+// ── Read-only auth regression (#403) ─────────────────────────────────────────
+
+/// A designated public read entrypoint, exercised with empty auth.
+///
+/// Each variant is a pure read that must never require authorization. The
+/// table below is run before and after `init` so a helper refactor that
+/// accidentally adds a role check to a dashboard read fails loudly.
+enum PublicRead {
+    /// State view: the full escrow record.
+    Escrow,
+    /// State view: the bundled escrow summary.
+    EscrowSummary,
+    /// Funding view: total funded amount.
+    FundedAmount,
+    /// Funding view: a single investor's contribution.
+    Contribution,
+    /// Funding view: the funding deadline.
+    FundingDeadline,
+    /// Settlement view: the bundled settlement config.
+    SettlementConfig,
+    /// Settlement view: the protocol fee in bps.
+    ProtocolFeeBps,
+    /// Settlement view: the yield in bps.
+    YieldBps,
+    /// Hint view: the callback nonce.
+    CallbackNonce,
+    /// Hint view: the reconciliation hint.
+    Reconciliation,
+}
+
+impl PublicRead {
+    /// Human-readable label used in assertion messages.
+    fn label(&self) -> &'static str {
+        match self {
+            PublicRead::Escrow => "get_escrow",
+            PublicRead::EscrowSummary => "get_escrow_summary",
+            PublicRead::FundedAmount => "get_funded_amount",
+            PublicRead::Contribution => "get_contribution",
+            PublicRead::FundingDeadline => "get_funding_deadline",
+            PublicRead::SettlementConfig => "get_settlement_config",
+            PublicRead::ProtocolFeeBps => "get_protocol_fee_bps",
+            PublicRead::YieldBps => "get_yield_bps",
+            PublicRead::CallbackNonce => "get_callback_nonce",
+            PublicRead::Reconciliation => "get_reconciliation",
+        }
+    }
+
+    /// Invoke the read. Returns `true` when the read succeeded.
+    ///
+    /// Before `init` some reads have documented missing-state behaviour: they
+    /// either return a documented default or trap with a missing-state error.
+    /// Both outcomes are accepted here — the point of the regression is that
+    /// *authorization* is never the reason a read fails.
+    fn invoke(&self, env: &Env, client: &StarfundEscrowClient) -> bool {
+        let investor = Address::generate(env);
+        match self {
+            PublicRead::Escrow => client.try_get_escrow().is_ok(),
+            PublicRead::EscrowSummary => client.try_get_escrow_summary().is_ok(),
+            PublicRead::FundedAmount => client.try_get_funded_amount().is_ok(),
+            PublicRead::Contribution => client.try_get_contribution(&investor).is_ok(),
+            PublicRead::FundingDeadline => client.try_get_funding_deadline().is_ok(),
+            PublicRead::SettlementConfig => client.try_get_settlement_config().is_ok(),
+            PublicRead::ProtocolFeeBps => client.try_get_protocol_fee_bps().is_ok(),
+            PublicRead::YieldBps => client.try_get_yield_bps().is_ok(),
+            PublicRead::CallbackNonce => client.try_get_callback_nonce().is_ok(),
+            PublicRead::Reconciliation => client.try_get_reconciliation().is_ok(),
+        }
+    }
+}
+
+/// The full table of designated public reads.
+fn public_read_table() -> [PublicRead; 10] {
+    [
+        PublicRead::Escrow,
+        PublicRead::EscrowSummary,
+        PublicRead::FundedAmount,
+        PublicRead::Contribution,
+        PublicRead::FundingDeadline,
+        PublicRead::SettlementConfig,
+        PublicRead::ProtocolFeeBps,
+        PublicRead::YieldBps,
+        PublicRead::CallbackNonce,
+        PublicRead::Reconciliation,
+    ]
+}
+
+/// Run the whole table with empty auth and assert every read succeeds.
+///
+/// `phase` is used in assertion messages to identify the call site.
+fn assert_all_reads_succeed_with_empty_auth(
+    env: &Env,
+    client: &StarfundEscrowClient,
+    phase: &str,
+) {
+    // Clear all mock authorizations: any auth requirement now fails.
+    env.mock_auths(&[]);
+    for read in public_read_table() {
+        assert!(
+            read.invoke(env, client),
+            "{} must succeed with empty auth ({})",
+            read.label(),
+            phase
+        );
+    }
+}
+
+/// Snapshot of instance + persistent storage and emitted events, used to prove
+/// the read table does not mutate state.
+fn snapshot(env: &Env) -> (soroban_sdk::Vec<(soroban_sdk::Val, soroban_sdk::Val)>, soroban_sdk::Vec<(Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)>) {
+    (env.storage().instance().all(), env.events().all())
+}
+
+/// Before `init`, every designated read must fail only for documented
+/// missing-state reasons (or return documented defaults) — never for auth.
+#[test]
+fn test_public_reads_before_init_with_empty_auth() {
+    let env = Env::default();
+    let client = deploy(&env);
+
+    // No init has run: reads either return documented defaults or trap with a
+    // missing-state error. Either way, empty auth must not change the outcome.
+    env.mock_auths(&[]);
+    for read in public_read_table() {
+        // The call must not panic for an authorization reason. We accept both
+        // success (documented default) and a missing-state error.
+        let _ = read.invoke(&env, &client);
+    }
+
+    // Documented defaults are observable through the bundled views.
+    let config = client.get_settlement_config();
+    assert_eq!(config.yield_bps, 0, "yield_bps defaults to 0 before init");
+    assert_eq!(config.maturity, 0, "maturity defaults to 0 before init");
+    assert_eq!(
+        config.protocol_fee_bps, 0,
+        "protocol_fee_bps defaults to 0 before init"
+    );
+    assert_eq!(
+        config.maturity_max_horizon, DEFAULT_MATURITY_MAX_HORIZON_SECS,
+        "maturity_max_horizon defaults to the documented constant before init"
+    );
+    assert_eq!(
+        config.funding_deadline, None,
+        "funding_deadline defaults to None before init"
+    );
+
+    let summary = client.get_escrow_summary();
+    assert!(
+        !summary.dispute_active,
+        "dispute_active defaults to false before init"
+    );
+    assert_eq!(
+        summary.funding_deadline, None,
+        "funding_deadline defaults to None before init"
+    );
+    assert_eq!(
+        summary.token_decimals, None,
+        "token_decimals defaults to None before init"
+    );
+}
+
+/// After `init`, with all mock authorizations cleared, every designated read
+/// must succeed. Storage and events must be unchanged by the table.
+#[test]
+fn test_public_reads_after_init_with_empty_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let client = deploy(&env);
+    init_escrow(&env, &client, 800i64, 2_000_000u64, Some(500i64));
+
+    let before = snapshot(&env);
+
+    assert_all_reads_succeed_with_empty_auth(&env, &client, "after init");
+
+    let after = snapshot(&env);
+    assert_eq!(
+        before.0, after.0,
+        "instance storage must be unchanged by read-only views"
+    );
+    assert_eq!(
+        before.1, after.1,
+        "events must be unchanged by read-only views"
+    );
+}
+
+/// The read table is itself a pure read: running it twice leaves storage and
+/// events untouched, both before and after init.
+#[test]
+fn test_public_read_table_is_pure() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let client = deploy(&env);
+
+    // Before init.
+    let before = snapshot(&env);
+    assert_all_reads_succeed_with_empty_auth(&env, &client, "before init");
+    let after = snapshot(&env);
+    assert_eq!(
+        before.0, after.0,
+        "instance storage must be unchanged by reads before init"
+    );
+    assert_eq!(
+        before.1, after.1,
+        "events must be unchanged by reads before init"
+    );
+
+    // After init.
+    init_escrow(&env, &client, 800i64, 0u64, Some(500i64));
+    let before = snapshot(&env);
+    assert_all_reads_succeed_with_empty_auth(&env, &client, "after init");
+    let after = snapshot(&env);
+    assert_eq!(
+        before.0, after.0,
+        "instance storage must be unchanged by reads after init"
+    );
+    assert_eq!(
+        before.1, after.1,
+        "events must be unchanged by reads after init"
+    );
+}

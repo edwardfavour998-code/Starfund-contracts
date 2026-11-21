@@ -39,9 +39,47 @@ The escrow wrapper is intentionally strict and supports standard SEP-41-like tok
 - Policy: unsupported behavior should be blocked by allowlisting and integration review.
 - Runtime fallback: if unsupported behavior occurs, transfer checks panic (safe failure).
 
+## Callback registration host model
+
+Callbacks are registered via `register_callback`, which records a `CallbackContext`
+(origin address, nonce, `created_at`) and returns the allocated nonce.
+
+### Supported origin address kinds
+
+- Only external contract addresses are supported as callback origins.
+- The escrow's own address (`env.current_contract_address()`) is **not** a supported origin:
+  a self-origin registration has no external origin authorization workflow and would create
+  unusable state.
+- Self-origin registration is rejected with the typed configuration error
+  (`Error::InvalidCallbackOrigin`) **before** any nonce is allocated, so a rejected
+  registration never consumes a nonce.
+- Any other contract address (e.g. a real external origin fixture) registers normally.
+
+### Callback lifetime and retirement policy
+
+- Registrations remain valid **indefinitely** by default. `created_at` is recorded for
+  observability and audit only; it does not by itself expire a registration.
+- A pending callback is retired only when it is explicitly cancelled by the admin or
+  consumed by execution. There is no implicit age-based expiration.
+- If an expiry policy is adopted in the future, it must be specified explicitly, including
+  exact-boundary behavior (e.g. whether a callback is still valid at `created_at + ttl`)
+  and backward compatibility for already-registered callbacks. Until then, reviewers should
+  treat old pending callbacks as still valid per this policy.
+
+### Admin cancellation workflow
+
+- The admin may cancel an outstanding callback registration; cancellation retires the
+  pending authorization so it can no longer be consumed.
+- Cancellation is the supported way to retire a callback that is no longer wanted, in place
+  of relying on age-based expiration.
+
 ## Reviewer checklist
 
 - Confirm all token transfers that matter for accounting use the wrapper in
   `escrow/src/external_calls.rs`.
 - Confirm both sender and recipient deltas are asserted exactly.
 - Confirm out-of-scope token behavior is documented in integration/security docs.
+- Confirm `register_callback` rejects the escrow's own address before nonce allocation and
+  still accepts real external contract origins.
+- Confirm callback lifetime behavior matches the documented policy (indefinite unless
+  cancelled or consumed).

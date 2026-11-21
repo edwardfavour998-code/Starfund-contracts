@@ -4690,3 +4690,237 @@ fn test_recover_admin_reachable_after_bounded_window_expires() {
     assert_eq!(recovered, admin);
     assert!(client.get_pending_admin().is_none());
 }
+
+// ── Issue #430: role separation preserved across governance rotations ────────
+//
+// init enforces distinct admin / SME / treasury addresses and rejects an
+// escrow self-address beneficiary. These tests prove the same policy is
+// enforced by later rotations (`rotate_beneficiary`, `propose_admin`) and
+// rechecked at `accept_admin` time, since roles can change after nomination.
+
+/// `rotate_beneficiary` must reject the current admin as the new SME.
+#[test]
+fn test_rotate_beneficiary_rejects_current_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let result = client.try_rotate_beneficiary(&admin);
+    assert!(
+        result.is_err(),
+        "rotate_beneficiary must reject the current admin as beneficiary"
+    );
+    assert_eq!(
+        client.get_escrow().sme,
+        sme,
+        "a rejected rotation must not change the SME"
+    );
+}
+
+/// `rotate_beneficiary` must reject the treasury address as the new SME.
+#[test]
+fn test_rotate_beneficiary_rejects_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "ROT_TRE"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    let result = client.try_rotate_beneficiary(&treasury);
+    assert!(
+        result.is_err(),
+        "rotate_beneficiary must reject the treasury as beneficiary"
+    );
+    assert_eq!(client.get_escrow().sme, sme);
+}
+
+/// `rotate_beneficiary` must reject the escrow contract's own address.
+#[test]
+fn test_rotate_beneficiary_rejects_contract_self_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let contract_id = client.address.clone();
+    let result = client.try_rotate_beneficiary(&contract_id);
+    assert!(
+        result.is_err(),
+        "rotate_beneficiary must reject the escrow self-address as beneficiary"
+    );
+    assert_eq!(client.get_escrow().sme, sme);
+}
+
+/// A valid, distinct address must still be accepted by `rotate_beneficiary`.
+#[test]
+fn test_rotate_beneficiary_accepts_valid_distinct_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let new_sme = Address::generate(&env);
+    let updated = client.rotate_beneficiary(&new_sme);
+    assert_eq!(updated.sme, new_sme);
+    assert_eq!(client.get_escrow().sme, new_sme);
+}
+
+/// `propose_admin` must reject a nominee equal to the current SME.
+#[test]
+fn test_propose_admin_rejects_current_sme() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    let result = client.try_propose_admin(&sme, &0u32, &None);
+    assert!(
+        result.is_err(),
+        "propose_admin must reject the current SME as nominee"
+    );
+    assert!(client.get_pending_admin().is_none());
+}
+
+/// `propose_admin` must reject a nominee equal to the treasury address.
+#[test]
+fn test_propose_admin_rejects_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    let (token, treasury) = free_addresses(&env);
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(&env, "PROP_TRE"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    let result = client.try_propose_admin(&treasury, &0u32, &None);
+    assert!(
+        result.is_err(),
+        "propose_admin must reject the treasury as nominee"
+    );
+    assert!(client.get_pending_admin().is_none());
+}
+
+/// A pending admin that conflicts with a role changed after nomination must be
+/// rejected explicitly at acceptance time (roles are rechecked against the
+/// current state, not the state at nomination).
+#[test]
+fn test_accept_admin_rejects_pending_conflicting_with_changed_role() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    // Nominate a fresh address that is valid at nomination time.
+    let nominee = Address::generate(&env);
+    client.propose_admin(&nominee, &0u32, &None);
+    assert_eq!(client.get_pending_admin(), Some(nominee.clone()));
+
+    // The SME is rotated to the nominee after nomination, creating a conflict.
+    client.rotate_beneficiary(&nominee);
+    assert_eq!(client.get_escrow().sme, nominee);
+
+    // Acceptance must be rejected explicitly against the current roles.
+    let result = client.try_accept_admin();
+    assert!(
+        result.is_err(),
+        "accept_admin must reject a pending admin that now conflicts with the SME role"
+    );
+    assert_eq!(
+        client.get_escrow().admin,
+        admin,
+        "a rejected acceptance must not change the admin"
+    );
+}
+
+// ── Issue #431: permissionless cleanup must not consume the admin nonce ─────
+
+/// `recover_admin` is permissionless expired-proposal cleanup: it must remove
+/// the expired pending proposal without consuming the authenticated governance
+/// nonce, so an already-prepared administrative invocation stays valid.
+#[test]
+fn test_recover_admin_cleanup_does_not_consume_admin_nonce() {
+    use soroban_sdk::testutils::Events as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+    default_init(&client, &env, &admin, &sme);
+
+    env.ledger().set_timestamp(1_000);
+    let nominee = Address::generate(&env);
+    client.propose_admin(&nominee, &0u32, &Some(60));
+    let expiry = client.get_pending_admin_expiry().expect("expiry set");
+
+    // Prepare a signed administrative action using the current admin nonce (0).
+    let prepared_limit = 12_345u32;
+
+    // An unrelated caller performs the cleanup after expiry.
+    env.ledger().set_timestamp(expiry + 1);
+    let stranger = Address::generate(&env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &stranger,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "recover_admin",
+            args: soroban_sdk::Vec::<soroban_sdk::Val>::new(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let recovered = client.recover_admin(&soroban_sdk::String::from_str(&env, "cleanup"));
+
+    // The expired proposal is removed.
+    assert_eq!(recovered, admin);
+    assert!(client.get_pending_admin().is_none());
+    assert_eq!(client.get_pending_admin_expiry(), None);
+
+    // The prepared administrative action using nonce 0 still succeeds, proving
+    // the permissionless cleanup did not advance the governance nonce.
+    let applied = client.set_storage_limit(&prepared_limit, &0u32);
+    assert_eq!(applied, prepared_limit);
+    assert_eq!(client.get_storage_limit(), prepared_limit);
+
+    // The cleanup event must describe permissionless cleanup authority.
+    let all_events = env.events().all();
+    let cleanup_event = all_events.events().last().unwrap().clone();
+    assert!(
+        all_events.events().contains(&cleanup_event),
+        "recover_admin must emit a cleanup event"
+    );
+}

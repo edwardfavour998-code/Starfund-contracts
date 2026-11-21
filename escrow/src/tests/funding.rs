@@ -7124,6 +7124,152 @@ fn test_fund_batch_duplicate_leaves_no_partial_state() {
     );
 }
 
+// ── Issue #401: fund_batch rollback on a later token transfer failure ─────────
+
+/// Token fixture that delegates to a real Stellar Asset Contract but fails the
+/// transfer for one designated "poisoned" investor. The failure is armed and
+/// disarmed through contract storage so a retry can succeed deterministically.
+#[soroban_sdk::contract]
+pub struct FailingTransferToken;
+
+#[soroban_sdk::contractimpl]
+impl FailingTransferToken {
+    pub fn set_poison(env: Env, investor: Address, armed: bool) {
+        env.storage()
+            .instance()
+            .set(&symbol_short!("poison"), &investor);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("armed"), &armed);
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        let poisoned: Option<Address> = env.storage().instance().get(&symbol_short!("poison"));
+        let armed: bool = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("armed"))
+            .unwrap_or(false);
+        if armed {
+            if let Some(poisoned) = poisoned {
+                if from == poisoned {
+                    panic!("injected token transfer failure");
+                }
+            }
+        }
+        soroban_sdk::token::TokenClient::new(&env, &to).transfer(&from, &to, &amount);
+    }
+}
+
+#[test]
+fn test_fund_batch_rolls_back_when_later_token_transfer_fails() {
+    use soroban_sdk::testutils::Events as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token = install_stellar_asset_token(&env);
+    let failing_id = env.register(FailingTransferToken, ());
+    let failing = FailingTransferTokenClient::new(&env, &failing_id);
+
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    client.init(
+        &admin,
+        &String::from_str(&env, "RB401"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &failing_id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    let inv_a = Address::generate(&env);
+    let inv_b = Address::generate(&env);
+    let amount_a = 10_000i128;
+    let amount_b = 20_000i128;
+
+    token.stellar.mint(&inv_a, &amount_a);
+    token.stellar.mint(&inv_b, &amount_b);
+
+    // Arm the failure for the second investor only.
+    failing.set_poison(&inv_b, &true);
+
+    let entries = SorobanVec::from_array(
+        &env,
+        [(inv_a.clone(), amount_a), (inv_b.clone(), amount_b)],
+    );
+
+    // Complete pre-state snapshot.
+    let before_escrow = client.get_escrow();
+    let before_contrib_a = client.get_contribution(&inv_a);
+    let before_contrib_b = client.get_contribution(&inv_b);
+    let before_funder_count = client.get_unique_funder_count();
+    let before_index = client.get_investors(&0, &10);
+    let before_balance_a = token.stellar.balance(&inv_a);
+    let before_balance_b = token.stellar.balance(&inv_b);
+    let before_balance_contract = token.stellar.balance(&client.address);
+    let before_events = env.events().all().events().len();
+
+    // The batch must fail atomically on the second transfer.
+    let result = client.try_fund_batch(&entries);
+    assert!(result.is_err(), "fund_batch must fail when a later transfer fails");
+
+    // Everything must be rolled back.
+    let after_escrow = client.get_escrow();
+    assert_eq!(after_escrow.funded_amount, before_escrow.funded_amount);
+    assert_eq!(after_escrow.status, before_escrow.status);
+    assert_eq!(client.get_contribution(&inv_a), before_contrib_a);
+    assert_eq!(client.get_contribution(&inv_b), before_contrib_b);
+    assert_eq!(client.get_unique_funder_count(), before_funder_count);
+    assert_eq!(client.get_investors(&0, &10), before_index);
+    assert_eq!(token.stellar.balance(&inv_a), before_balance_a);
+    assert_eq!(token.stellar.balance(&inv_b), before_balance_b);
+    assert_eq!(
+        token.stellar.balance(&client.address),
+        before_balance_contract
+    );
+    assert_eq!(
+        env.events().all().events().len(),
+        before_events,
+        "no events may survive a rolled-back fund_batch"
+    );
+
+    // Disarm the failure and retry: the batch must now succeed.
+    failing.set_poison(&inv_b, &false);
+
+    let funded = client.fund_batch(&entries);
+    assert_eq!(funded.funded_amount, amount_a + amount_b);
+    assert_eq!(client.get_contribution(&inv_a), amount_a);
+    assert_eq!(client.get_contribution(&inv_b), amount_b);
+    assert_eq!(client.get_unique_funder_count(), 2);
+    assert_eq!(client.get_investors(&0, &10).len(), 2);
+    assert_eq!(token.stellar.balance(&inv_a), 0);
+    assert_eq!(token.stellar.balance(&inv_b), 0);
+    assert_eq!(
+        token.stellar.balance(&client.address),
+        amount_a + amount_b
+    );
+    assert!(
+        env.events().all().events().len() > before_events,
+        "successful retry must emit funding events"
+    );
+}
+
 // ── unfund entrypoint tests ───────────────────────────────────────────────────
 
 /// Helper: init with a real SAC token and return (client, contract_id, sac_admin, token_id, investor).

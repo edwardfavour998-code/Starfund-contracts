@@ -23,6 +23,31 @@ cargo build
 cargo test
 ```
 
+### Local environment preflight
+
+Before building, run the non-mutating preflight to check that your local
+environment has everything this repository needs:
+
+```bash
+./scripts/preflight.sh
+```
+
+The preflight only inspects the environment — it never installs tools, adds
+targets, or modifies files. It reports:
+
+| Check | Required | Setup |
+|-------|----------|-------|
+| `cargo` | Yes | [Install Rust](https://www.rust-lang.org/tools/install) |
+| `rustc` (must match `rust-toolchain.toml`) | Yes | [Install Rust](https://www.rust-lang.org/tools/install) / `rustup toolchain install` |
+| `wasm32v1-none` target | Yes | `rustup target add wasm32v1-none` ([rustup targets](https://rust-lang.github.io/rustup/cross-compilation.html)) |
+| `node` | Yes | [Install Node.js](https://nodejs.org/en/download) |
+| `stellar` CLI | Optional | [Stellar CLI docs](https://developers.stellar.org/docs/tools/soroban-cli/stellar-cli) |
+
+Optional tools are clearly marked as optional and never cause a failure. The
+command exits with a **nonzero status when any required tool is missing or
+out of date**, so it can be used directly in scripts and CI; a zero exit code
+means the required toolchain is ready.
+
 ---
 
 ## Schema version changelog (`DataKey::Version`)

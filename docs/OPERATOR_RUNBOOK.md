@@ -657,7 +657,114 @@ This recovery flow ensures that admin key rotation is always available as an eme
 
 ---
 
+## 8.5. Investor diagnostics: absent vs. archived vs. expired
+
+The rent planner classifies investor keys, but **an absent key is not proof of
+expiry**. Optional per-investor keys (for example a claim marker) are only
+written when the corresponding action happens; a fresh investor who has never
+claimed has no claim marker at all. Treating that absence as "Expired" leads
+operators to attempt unnecessary restoration or to misdiagnose a healthy,
+fresh investor.
+
+### Tri-state diagnostic
+
+When inspecting an investor, classify each key into exactly one of three
+states:
+
+| State | Meaning | Operator action |
+|-------|---------|-----------------|
+| **Absent-optional** | The key was never created because the optional action never occurred (e.g. no claim marker for an investor who never claimed). | None. This is a normal, expected state — not an error and not expiry. |
+| **Unknown archival state** | The key is absent but the ledger does not prove whether it was ever written and later archived, or never written at all. | Do **not** restore. Gather ledger evidence first (see below). |
+| **Confirmed expired** | The key is absent **and** ledger evidence proves the entry existed and was archived (TTL exhausted / archived entry). | Follow the restoration procedure. |
+
+Rule of thumb: **absence alone is never "confirmed expired".** Only ledger
+evidence upgrades a diagnostic from *unknown archival state* to *confirmed
+expired*.
+
+### Ledger evidence required before restoration
+
+Restoration guidance applies only when you can produce ledger evidence that the
+entry existed and was archived, for example:
+
+- A prior ledger entry / transaction meta showing the key was written for that
+  investor (e.g. a `claim` or `fund` invocation that set the key).
+- An archival record (entry TTL exhausted and the entry archived) for that
+  specific key.
+- An indexer or event history that shows the key being created and later
+  archived.
+
+If none of these exist, the correct conclusion is **absent-optional** (never
+created) or **unknown archival state** — in both cases do **not** attempt
+restoration. A fresh investor with no claim marker must be reported as
+"no claim recorded", never as "proven expired".
+
+### Validation checklist
+
+Compare three cases when validating diagnostics:
+
+1. **Fresh investor** — no claim marker, no ledger evidence → reported as
+   absent-optional, not expired.
+2. **Fully exited investor** — keys written and consumed/cleared by normal
+   flow → reported per the stored state, not as expiry.
+3. **Externally confirmed archived key** — ledger evidence of archival exists →
+   the only case reported as confirmed expired, with restoration guidance.
+
+---
+
+## 8.6. Pending callback registrations: limits, migration, pagination
+
+`register_callback` appends to the pending-callback nonce index. To keep
+instance storage bounded and removal scans cheap, the contract enforces a
+**measured maximum pending callback count**. Registrations beyond that ceiling
+are rejected **before any mutation**, so a rejected call leaves storage
+unchanged (atomic failure).
+
+### Registration limit
+
+- The exact maximum number of pending callbacks succeeds.
+- One more registration fails atomically (no partial write, no nonce consumed).
+- Consuming a callback (removing it from the pending index) **frees a slot**,
+  so a new registration is accepted afterwards.
+
+Operators should monitor the pending count and consume callbacks promptly
+rather than relying on the ceiling as a queue.
+
+### Bounded reconstruction cursor
+
+Legacy instances may have a large historical `CallbackNonce` with a missing or
+incomplete pending index. The contract does **not** scan `1..=CallbackNonce` in
+ordinary calls. Instead, reconstruction advances through a **bounded cursor**:
+each reconstruction call performs a fixed, limited amount of work and persists
+its progress. Repeated calls make bounded progress until the index is complete.
+
+- Each reconstruction call has a fixed work limit (independent of the
+  historical nonce magnitude).
+- No pending callback is lost: the cursor only advances past nonces it has
+  examined, and pending contexts found are recorded.
+- Normal registration stays bounded and is unaffected by the historical nonce.
+
+Operational guidance: if a legacy instance needs reconstruction, invoke the
+reconstruction path repeatedly (each call is bounded) until it reports
+completion, rather than expecting a single call to rebuild the whole index.
+
+### Read-only paginated enumeration
+
+Operators no longer need to scan historical nonces or retain a complete event
+history to inspect outstanding callbacks. A bounded, read-only pagination API
+returns a page of pending callback contexts:
+
+- The page limit is enforced (requests above the maximum are capped/rejected).
+- Only **unconsumed** contexts are returned; consumed callbacks are skipped.
+- The call performs **no authorization and no writes** — it is safe to run
+  from any read-only operator tooling.
+
+Concatenating successive pages yields exactly the stored pending contexts,
+including gaps left by consumed callbacks.
+
+---
+
 ## 9. Version compatibility matrix
+=======
 
 | WASM version (SCHEMA_VERSION) | Can read data from | Notes |
 |-------------------------------|-------------------|-------|
